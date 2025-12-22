@@ -19,17 +19,17 @@ from mathutils import Matrix
 
 # ====== Property Group ======
 class CameraExportSettings(PropertyGroup):
-    output_prefix: StringProperty(
-        name="File Prefix",
-        description="Prefix for output files (e.g., 'render_' will create render_0001.png)",
-        default="render_"
-    )
-
-    output_directory: StringProperty(
-        name="Output Directory",
-        description="Directory to save rendered images and camera data",
+    export_directory: StringProperty(
+        name="Export Directory",
+        description="Parent directory where work folders will be created",
         default="//",
         subtype='DIR_PATH'
+    )
+
+    work_name: StringProperty(
+        name="Name of work",
+        description="Name of the work - used as directory name and file prefix",
+        default="render"
     )
 
 
@@ -154,8 +154,8 @@ class CAMERA_PT_InfoPanel(Panel):
         settings_box = layout.box()
         settings_box.label(text="Output Settings:", icon='FILEBROWSER')
         settings = context.scene.camera_export_settings
-        settings_box.prop(settings, "output_directory")
-        settings_box.prop(settings, "output_prefix")
+        settings_box.prop(settings, "export_directory")
+        settings_box.prop(settings, "work_name")
 
         # Render button
         layout.separator()
@@ -185,13 +185,16 @@ class CAMERA_OT_RenderAndExport(Operator):
         scene = context.scene
         settings = scene.camera_export_settings
 
-        # Get output directory and prefix
-        output_dir = bpy.path.abspath(settings.output_directory)
-        prefix = settings.output_prefix
+        # Get export directory and work name
+        export_base_dir = bpy.path.abspath(settings.export_directory)
+        work_name = settings.work_name
         frame_number = scene.frame_current
 
-        # Create filename: prefix + frame number (4 digits) + .png
-        filename = f"{prefix}{frame_number:04d}.png"
+        # Create output directory: export_directory/work_name/
+        output_dir = os.path.join(export_base_dir, work_name)
+
+        # Create filename: work_name + frame number (4 digits) + .png
+        filename = f"{work_name}_{frame_number:04d}.png"
         output_path = os.path.join(output_dir, filename)
 
         # Create directory if it doesn't exist
@@ -208,7 +211,7 @@ class CAMERA_OT_RenderAndExport(Operator):
         scene.render.filepath = original_filepath
 
         # Create JSON filename
-        json_filename = f"{prefix}{frame_number:04d}.json"
+        json_filename = f"{work_name}_{frame_number:04d}.json"
         json_path = os.path.join(output_dir, json_filename)
 
         # Export camera data
@@ -217,83 +220,14 @@ class CAMERA_OT_RenderAndExport(Operator):
         # Get camera position (Blender coordinates)
         pos_blender = camera.location
 
-        # Convert position from Blender (Z-up) to Three.js (Y-up)
-        # Blender: (X, Y, Z) -> Three.js: (X, Z, -Y)
-        pos_threejs = {
-            "x": float(pos_blender.x),
-            "y": float(pos_blender.z),
-            "z": float(-pos_blender.y)
-        }
-
         # Get camera rotation as quaternion
         if camera.rotation_mode == 'QUATERNION':
-            quat_blender = camera.rotation_quaternion.copy()
+            quaternion_blender = camera.rotation_quaternion.copy()
         elif camera.rotation_mode == 'AXIS_ANGLE':
-            quat_blender = camera.rotation_axis_angle.to_quaternion()
+            quaternion_blender = camera.rotation_axis_angle.to_quaternion()
         else:
-            quat_blender = camera.rotation_euler.to_quaternion()
+            quaternion_blender = camera.rotation_euler.to_quaternion()
 
-        # Convert quaternion from Blender to Three.js coordinate system
-        # Create rotation matrix for coordinate system conversion
-        # Blender (X, Y, Z) -> Three.js (X, Z, -Y)
-        conv_matrix = Matrix((
-            (1,  0,  0),
-            (0,  0, -1),
-            (0,  1,  0)
-        ))
-
-        # Convert quaternion
-        quat_matrix = quat_blender.to_matrix()
-        converted_matrix = conv_matrix @ quat_matrix @ conv_matrix.transposed()
-        quat_threejs = converted_matrix.to_quaternion()
-
-        rot_threejs = {
-            "x": float(quat_threejs.x),
-            "y": float(quat_threejs.y),
-            "z": float(quat_threejs.z),
-            "w": float(quat_threejs.w)
-        }
-
-        # Calculate vertical FOV for Three.js
-        aspect_ratio = scene.render.resolution_x / scene.render.resolution_y
-
-        if cam_data.lens_unit == 'MILLIMETERS':
-            # Determine which FOV we're calculating from sensor fit
-            if cam_data.sensor_fit == 'VERTICAL':
-                # Already vertical FOV
-                sensor_size = cam_data.sensor_height
-                fov_rad = 2 * math.atan(sensor_size / (2 * cam_data.lens))
-                fov_vertical = math.degrees(fov_rad)
-            elif cam_data.sensor_fit == 'HORIZONTAL':
-                # Horizontal FOV, need to convert to vertical
-                sensor_size = cam_data.sensor_width
-                fov_h_rad = 2 * math.atan(sensor_size / (2 * cam_data.lens))
-                # Convert horizontal FOV to vertical FOV
-                fov_v_rad = 2 * math.atan(math.tan(fov_h_rad / 2) / aspect_ratio)
-                fov_vertical = math.degrees(fov_v_rad)
-            else:  # AUTO
-                # Depends on aspect ratio
-                if aspect_ratio > (cam_data.sensor_width / cam_data.sensor_height):
-                    # Use horizontal sensor, convert to vertical
-                    sensor_size = cam_data.sensor_width
-                    fov_h_rad = 2 * math.atan(sensor_size / (2 * cam_data.lens))
-                    fov_v_rad = 2 * math.atan(math.tan(fov_h_rad / 2) / aspect_ratio)
-                    fov_vertical = math.degrees(fov_v_rad)
-                else:
-                    # Use vertical sensor
-                    sensor_size = cam_data.sensor_height
-                    fov_rad = 2 * math.atan(sensor_size / (2 * cam_data.lens))
-                    fov_vertical = math.degrees(fov_rad)
-        else:
-            # FOV mode - camera.angle could be horizontal or vertical
-            fov_rad = cam_data.angle
-            if cam_data.sensor_fit == 'HORIZONTAL':
-                # Convert to vertical
-                fov_v_rad = 2 * math.atan(math.tan(fov_rad / 2) / aspect_ratio)
-                fov_vertical = math.degrees(fov_v_rad)
-            else:
-                # Already vertical or auto (use vertical)
-                fov_vertical = math.degrees(fov_rad)
 
         # Export lights data
         lights_data = []
@@ -301,15 +235,15 @@ class CAMERA_OT_RenderAndExport(Operator):
             if obj.type == 'LIGHT':
                 light_data_obj = obj.data
 
-                # Get light position
+                # Get light position (raw Blender coordinates)
                 light_pos_blender = obj.location
-                light_pos_threejs = {
+                light_pos = {
                     "x": float(light_pos_blender.x),
-                    "y": float(light_pos_blender.z),
-                    "z": float(-light_pos_blender.y)
+                    "y": float(light_pos_blender.y),
+                    "z": float(light_pos_blender.z)
                 }
 
-                # Get light rotation as quaternion
+                # Get light rotation as quaternion (raw Blender quaternion)
                 if obj.rotation_mode == 'QUATERNION':
                     light_quat_blender = obj.rotation_quaternion.copy()
                 elif obj.rotation_mode == 'AXIS_ANGLE':
@@ -317,24 +251,19 @@ class CAMERA_OT_RenderAndExport(Operator):
                 else:
                     light_quat_blender = obj.rotation_euler.to_quaternion()
 
-                # Convert quaternion to Three.js coordinate system
-                light_quat_matrix = light_quat_blender.to_matrix()
-                light_converted_matrix = conv_matrix @ light_quat_matrix @ conv_matrix.transposed()
-                light_quat_threejs = light_converted_matrix.to_quaternion()
-
-                light_rot_threejs = {
-                    "x": float(light_quat_threejs.x),
-                    "y": float(light_quat_threejs.y),
-                    "z": float(light_quat_threejs.z),
-                    "w": float(light_quat_threejs.w)
+                light_rot = {
+                    "x": float(light_quat_blender.x),
+                    "y": float(light_quat_blender.y),
+                    "z": float(light_quat_blender.z),
+                    "w": float(light_quat_blender.w)
                 }
 
                 # Get light properties
                 light_info = {
                     "name": obj.name,
                     "type": light_data_obj.type,  # POINT, SUN, SPOT, AREA
-                    "position": light_pos_threejs,
-                    "rotation": light_rot_threejs,
+                    "position": light_pos,
+                    "rotation": light_rot,
                     "power": float(light_data_obj.energy),
                     "color": {
                         "r": float(light_data_obj.color[0]),
@@ -344,9 +273,8 @@ class CAMERA_OT_RenderAndExport(Operator):
                 }
 
                 # Add type-specific properties
-                if light_data_obj.type == 'SPOT':
-                    light_info["spot_size"] = float(light_data_obj.spot_size)
-                    light_info["spot_blend"] = float(light_data_obj.spot_blend)
+                if light_data_obj.type == 'POINT':
+                    light_info["radius"] = float(light_data_obj.shadow_soft_size)
                 elif light_data_obj.type == 'AREA':
                     light_info["size"] = float(light_data_obj.size)
                     if light_data_obj.shape == 'RECTANGLE':
@@ -357,9 +285,18 @@ class CAMERA_OT_RenderAndExport(Operator):
         # Create export data
         export_data = {
             "camera": {
-                "position": pos_threejs,
-                "rotation": rot_threejs,
-                "fov": float(fov_vertical)
+                "position": {
+                    "x": float(pos_blender.x),
+                    "y": float(pos_blender.y),
+                    "z": float(pos_blender.z)
+                },
+                "rotation": {
+                    "x": float(quaternion_blender.x),
+                    "y": float(quaternion_blender.y),
+                    "z": float(quaternion_blender.z),
+                    "w": float(quaternion_blender.w)
+                },
+                "fov": float(camera.data.angle)
             },
             "lights": lights_data
         }
@@ -369,10 +306,20 @@ class CAMERA_OT_RenderAndExport(Operator):
             with open(json_path, 'w') as f:
                 json.dump(export_data, f, indent=2)
             self.report({'INFO'}, f"Camera data exported to {json_path}")
-            return {'FINISHED'}
         except Exception as e:
             self.report({'ERROR'}, f"Failed to write camera data: {str(e)}")
             return {'FINISHED'}  # Still return FINISHED since render was triggered
+
+        # Save blend file in the work directory
+        blend_filename = f"{work_name}_{frame_number:04d}.blend"
+        blend_path = os.path.join(output_dir, blend_filename)
+        try:
+            bpy.ops.wm.save_as_mainfile(filepath=blend_path, copy=True)
+            self.report({'INFO'}, f"Blend file saved to {blend_path}")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to save blend file: {str(e)}")
+
+        return {'FINISHED'}
 
 
 # ====== Registration ======
