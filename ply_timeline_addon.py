@@ -154,10 +154,28 @@ class PLYFrameHandler:
         self.update_mesh(ply_data)
 
         # Update camera target position if available
+        print(f"[PLY Handler] Camera target: {self.camera_target}, Metadata: {metadata}")
+
         if self.camera_target and metadata and 'torso_position' in metadata:
-            torso_pos = metadata['torso_position']
-            self.camera_target.location = torso_pos
-            print(f"[PLY Handler] Updated camera target to: {torso_pos}")
+            # Unity coordinates: (x, y, z)
+            x, y, z = metadata['torso_position']
+
+            # Apply Unity to Blender transformation:
+            # 1. Rotate 90° around X-axis: (x, y, z) -> (x, -z, y)
+            # 2. Scale by 20
+            blender_x = x * 20
+            blender_y = -z * 20
+            blender_z = y * 20
+
+            self.camera_target.location = (blender_x, blender_y, blender_z)
+            print(f"[PLY Handler] Updated camera target: Unity{metadata['torso_position']} -> Blender({blender_x:.3f}, {blender_y:.3f}, {blender_z:.3f})")
+        else:
+            if not self.camera_target:
+                print("[PLY Handler] No camera target object")
+            elif not metadata:
+                print("[PLY Handler] No metadata found")
+            elif 'torso_position' not in metadata:
+                print(f"[PLY Handler] torso_position not in metadata. Available keys: {list(metadata.keys())}")
 
         self.obj.hide_viewport = False
         self.obj.hide_render = False
