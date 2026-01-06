@@ -12,6 +12,7 @@ import bpy
 import numpy as np
 import os
 import glob
+import re
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty, IntProperty, BoolProperty, EnumProperty
 from bpy.types import Panel, Operator, PropertyGroup
@@ -26,18 +27,54 @@ class PLYLoader:
     def load_ply_binary(ply_path):
         """
         Load PLY file with position, color, and motion vectors.
-        Returns: numpy structured array or None if failed
+        Returns: (numpy structured array, metadata dict) or (None, None) if failed
         """
         if not os.path.exists(ply_path):
             print(f"PLY file not found: {ply_path}")
-            return None
+            return None, None
 
         try:
-            # Read header
+            metadata = {}
+
+            # Read header and parse metadata
             with open(ply_path, 'rb') as f:
                 line = b''
                 while line.strip() != b'end_header':
                     line = f.readline()
+
+                    # Parse comment lines for metadata
+                    if line.startswith(b'comment'):
+                        comment = line.decode('utf-8').strip()
+
+                        # Parse torso_7_global_position
+                        if 'torso_7_global_position:' in comment:
+                            parts = comment.split('torso_7_global_position:')[1].strip().split()
+                            if len(parts) == 3:
+                                try:
+                                    metadata['torso_position'] = (
+                                        float(parts[0]),
+                                        float(parts[1]),
+                                        float(parts[2])
+                                    )
+                                except ValueError:
+                                    pass
+
+                        # Parse PointCloudFrame
+                        elif 'PointCloudFrame:' in comment:
+                            parts = comment.split('PointCloudFrame:')[1].strip()
+                            try:
+                                metadata['pointcloud_frame'] = int(parts)
+                            except ValueError:
+                                pass
+
+                        # Parse BvhFrame
+                        elif 'BvhFrame:' in comment:
+                            parts = comment.split('BvhFrame:')[1].strip()
+                            try:
+                                metadata['bvh_frame'] = int(parts)
+                            except ValueError:
+                                pass
+
                 header_end = f.tell()
 
             # Binary data structure
@@ -52,21 +89,22 @@ class PLYLoader:
                 f.seek(header_end)
                 data = np.fromfile(f, dtype=dt)
 
-            return data
+            return data, metadata
 
         except Exception as e:
             print(f"Error loading PLY: {e}")
-            return None
+            return None, None
 
 
 # ====== Frame Handler with Caching ======
 class PLYFrameHandler:
     """Handles frame changes and loads PLY files on-demand"""
 
-    def __init__(self, frame_map, obj, mesh, cache_size=10):
+    def __init__(self, frame_map, obj, mesh, camera_target=None, cache_size=10):
         self.frame_map = frame_map  # {frame_num: filepath}
         self.obj = obj
         self.mesh = mesh
+        self.camera_target = camera_target  # Camera target object for torso position
         self.cache = OrderedDict()  # LRU cache
         self.cache_size = cache_size
         self.current_loaded_frame = None
@@ -91,21 +129,21 @@ class PLYFrameHandler:
         # Check cache first
         if current_frame in self.cache:
             print(f"[PLY Handler] Loading frame {current_frame} from cache")
-            ply_data = self.cache[current_frame]
+            ply_data, metadata = self.cache[current_frame]
             # Move to end (most recently used)
             self.cache.move_to_end(current_frame)
         else:
             # Load from file
             ply_path = self.frame_map[current_frame]
             print(f"[PLY Handler] Loading frame {current_frame} from file: {ply_path}")
-            ply_data = PLYLoader.load_ply_binary(ply_path)
+            ply_data, metadata = PLYLoader.load_ply_binary(ply_path)
 
             if ply_data is None:
                 self.obj.hide_viewport = True
                 return
 
-            # Add to cache
-            self.cache[current_frame] = ply_data
+            # Add to cache (both data and metadata)
+            self.cache[current_frame] = (ply_data, metadata)
 
             # Evict oldest if cache full
             if len(self.cache) > self.cache_size:
@@ -114,6 +152,12 @@ class PLYFrameHandler:
 
         # Update mesh
         self.update_mesh(ply_data)
+
+        # Update camera target position if available
+        if self.camera_target and metadata and 'torso_position' in metadata:
+            torso_pos = metadata['torso_position']
+            self.camera_target.location = torso_pos
+            print(f"[PLY Handler] Updated camera target to: {torso_pos}")
 
         self.obj.hide_viewport = False
         self.obj.hide_render = False
@@ -165,12 +209,6 @@ class PLYTimelineSettings(PropertyGroup):
         subtype='DIR_PATH'
     )
 
-    frame_pattern: StringProperty(
-        name="Frame Pattern",
-        description="Filename pattern for PLY files (use * as wildcard)",
-        default="filtered_frame_*.ply"
-    )
-
     object_name: StringProperty(
         name="Object Name",
         description="Name for the point cloud object",
@@ -195,6 +233,18 @@ class PLYTimelineSettings(PropertyGroup):
         name="Apply Geometry Nodes",
         description="Automatically apply a Geometry Nodes modifier",
         default=False
+    )
+
+    create_camera_target: BoolProperty(
+        name="Create Camera Target",
+        description="Create an empty object at torso position for camera tracking",
+        default=True
+    )
+
+    camera_target_name: StringProperty(
+        name="Camera Target Name",
+        description="Name for the camera target object",
+        default="PLY_CameraTarget"
     )
 
     def get_node_groups(self, context):
@@ -230,31 +280,34 @@ class PLY_OT_SetupTimeline(Operator):
         print("[PLY Setup] Starting PLY Timeline setup...")
         print("=" * 50)
 
-        # Discover PLY files
-        search_pattern = os.path.join(settings.ply_directory, settings.frame_pattern)
+        # Discover all PLY files in directory
+        search_pattern = os.path.join(settings.ply_directory, "*.ply")
         print(f"[PLY Setup] Searching for: {search_pattern}")
         ply_files = glob.glob(search_pattern)
-        print(f"[PLY Setup] Found {len(ply_files)} files")
+        print(f"[PLY Setup] Found {len(ply_files)} PLY files")
 
         if not ply_files:
-            self.report({'ERROR'}, f"No PLY files found matching: {search_pattern}")
+            self.report({'ERROR'}, f"No PLY files found in: {settings.ply_directory}")
             return {'CANCELLED'}
 
-        # Build frame map
+        # Build frame map - extract numbers from filenames
+        import re
         frame_map = {}
         for filepath in ply_files:
             filename = os.path.basename(filepath)
-            try:
-                # Extract frame number (assumes format: prefix_XXXX.ply)
-                frame_str = filename.replace(settings.frame_pattern.replace("*.ply", ""), "").replace(".ply", "")
-                frame_num = int(frame_str)
+            # Find all numbers in filename
+            numbers = re.findall(r'\d+', filename)
+            if numbers:
+                # Use the last number found (usually the frame number)
+                frame_num = int(numbers[-1])
                 frame_map[frame_num] = filepath
-            except ValueError:
-                self.report({'WARNING'}, f"Could not parse frame number from: {filename}")
+                print(f"[PLY Setup] {filename} -> frame {frame_num}")
+            else:
+                self.report({'WARNING'}, f"No frame number found in: {filename}")
                 continue
 
         if not frame_map:
-            self.report({'ERROR'}, "No valid PLY files found")
+            self.report({'ERROR'}, "No PLY files with frame numbers found")
             return {'CANCELLED'}
 
         # Get or create object
@@ -265,6 +318,18 @@ class PLY_OT_SetupTimeline(Operator):
             mesh = bpy.data.meshes.new(f"{settings.object_name}_Mesh")
             obj = bpy.data.objects.new(settings.object_name, mesh)
             context.scene.collection.objects.link(obj)
+
+        # Create or get camera target
+        camera_target = None
+        if settings.create_camera_target:
+            if settings.camera_target_name in bpy.data.objects:
+                camera_target = bpy.data.objects[settings.camera_target_name]
+            else:
+                camera_target = bpy.data.objects.new(settings.camera_target_name, None)
+                camera_target.empty_display_type = 'SPHERE'
+                camera_target.empty_display_size = 0.2
+                context.scene.collection.objects.link(camera_target)
+                print(f"[PLY Setup] Created camera target: {settings.camera_target_name}")
 
         # Apply Geometry Nodes if enabled
         if settings.use_geometry_nodes and settings.geometry_nodes_group != 'NONE':
@@ -293,7 +358,7 @@ class PLY_OT_SetupTimeline(Operator):
                 bpy.app.handlers.frame_change_post.remove(_global_handler)
 
         # Create and register new handler
-        _global_handler = PLYFrameHandler(frame_map, obj, mesh, settings.cache_size)
+        _global_handler = PLYFrameHandler(frame_map, obj, mesh, camera_target, settings.cache_size)
         bpy.app.handlers.frame_change_post.append(_global_handler)
         print(f"[PLY Setup] Handler registered! Total handlers: {len(bpy.app.handlers.frame_change_post)}")
 
@@ -380,7 +445,6 @@ class PLY_PT_TimelinePanel(Panel):
         box = layout.box()
         box.label(text="Settings:", icon='SETTINGS')
         box.prop(settings, "ply_directory")
-        box.prop(settings, "frame_pattern")
         box.prop(settings, "object_name")
         box.prop(settings, "cache_size")
 
@@ -391,6 +455,14 @@ class PLY_PT_TimelinePanel(Panel):
         gn_box.prop(settings, "use_geometry_nodes")
         if settings.use_geometry_nodes:
             gn_box.prop(settings, "geometry_nodes_group")
+
+        # Camera Target section
+        layout.separator()
+        cam_box = layout.box()
+        cam_box.label(text="Camera Target:", icon='EMPTY_AXIS')
+        cam_box.prop(settings, "create_camera_target")
+        if settings.create_camera_target:
+            cam_box.prop(settings, "camera_target_name")
 
         # Status section
         layout.separator()
