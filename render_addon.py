@@ -935,31 +935,38 @@ class CAMERA_OT_LoopRender(Operator):
         """Called when render completes"""
         print(f"[Loop Render] Render completion handler triggered")
 
-        # Get context
-        context = bpy.context
-
-        # Export data
-        print(f"[Loop Render] Exporting data...")
-        self.export_data_after_render(context)
-
-        # Update counters
-        self._waiting_for_render = False
-        self._render_count += 1
-        settings = context.scene.camera_export_settings
-        settings.loop_render_count = self._render_count
-
-        # Check if should stop
-        max_renders = settings.max_renders
-        if max_renders > 0 and self._render_count >= max_renders:
-            print(f"[Loop Render] Max renders reached, stopping")
-            settings.is_loop_rendering = False
-
-        # Remove the handler
+        # Remove the handler first to prevent re-entry
         try:
             if self.render_complete_handler in bpy.app.handlers.render_complete:
                 bpy.app.handlers.render_complete.remove(self.render_complete_handler)
         except Exception as e:
             print(f"[Loop Render] Error removing handler: {e}")
+
+        # Defer export operations to after the render handler completes
+        # This prevents "update requested during evaluation" errors
+        def deferred_export():
+            print(f"[Loop Render] Executing deferred export...")
+            context = bpy.context
+
+            # Export data
+            self.export_data_after_render(context)
+
+            # Update counters
+            self._waiting_for_render = False
+            self._render_count += 1
+            settings = context.scene.camera_export_settings
+            settings.loop_render_count = self._render_count
+
+            # Check if should stop
+            max_renders = settings.max_renders
+            if max_renders > 0 and self._render_count >= max_renders:
+                print(f"[Loop Render] Max renders reached, stopping")
+                settings.is_loop_rendering = False
+
+            return None  # Don't repeat
+
+        # Schedule export to happen after handler completes
+        bpy.app.timers.register(deferred_export, first_interval=0.1)
 
     def start_next_render(self, context):
         """Select random frame, randomize camera, and start render"""
@@ -975,6 +982,7 @@ class CAMERA_OT_LoopRender(Operator):
             return self.finish(context)
 
         random_frame = random.randint(frame_min, frame_max)
+        # frame_set() triggers depsgraph update internally
         scene.frame_set(random_frame)
 
         # Randomize camera position
@@ -1035,13 +1043,13 @@ class CAMERA_OT_LoopRender(Operator):
         # Mark that we're waiting for render
         self._waiting_for_render = True
 
-        # Use app.timers to delay render invocation slightly
-        # This allows the modal operator to yield control
+        # Use app.timers to delay render invocation
+        # This allows depsgraph updates to complete and prevents race conditions
         def delayed_render():
             bpy.ops.render.render('INVOKE_DEFAULT', write_still=True)
             return None  # Don't repeat
 
-        bpy.app.timers.register(delayed_render, first_interval=0.1)
+        bpy.app.timers.register(delayed_render, first_interval=0.5)
         print(f"[Loop Render] Scheduled render to start")
 
     def export_data_after_render(self, context):
