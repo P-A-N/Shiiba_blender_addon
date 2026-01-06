@@ -3,7 +3,7 @@ bl_info = {
     "author": "horristic",
     "version": (1, 0, 0),
     "blender": (4, 4, 0),
-    "location": "View3D > Sidebar > Camera Info",
+    "location": "View3D > Sidebar > Render & Export",
     "description": "Display current camera position, rotation, and FOV",
     "category": "3D View",
 }
@@ -36,11 +36,11 @@ class CameraExportSettings(PropertyGroup):
 # ====== UI Panel ======
 class CAMERA_PT_InfoPanel(Panel):
     """Creates a Panel in the 3D Viewport sidebar showing camera information"""
-    bl_label = "Camera Info"
+    bl_label = "Render & Export"
     bl_idname = "CAMERA_PT_info_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'Camera Info'
+    bl_category = 'Render & Export'
 
     def draw(self, context):
         layout = self.layout
@@ -171,6 +171,25 @@ class CAMERA_OT_RenderAndExport(Operator):
     bl_label = "Render and Export"
     bl_description = "Render image and save camera data as JSON alongside the image"
 
+    _timer = None
+    _rendering = False
+
+    def modal(self, context, event):
+        if event.type == 'TIMER':
+            # Check if rendering is complete
+            if not self._rendering:
+                # Rendering finished, now export data
+                self.export_data(context)
+                self.cancel_timer(context)
+                return {'FINISHED'}
+
+        return {'PASS_THROUGH'}
+
+    def cancel_timer(self, context):
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+
     def execute(self, context):
         camera = context.scene.camera
         if camera is None:
@@ -193,26 +212,76 @@ class CAMERA_OT_RenderAndExport(Operator):
         # Create output directory: export_directory/work_name/
         output_dir = os.path.join(export_base_dir, work_name)
 
-        # Create filename: work_name + frame number (4 digits) + .png
-        filename = f"{work_name}_{frame_number:04d}.png"
-        output_path = os.path.join(output_dir, filename)
-
         # Create directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
 
+        # Find next available filename with index if file exists
+        base_filename = f"{work_name}_{frame_number:04d}"
+        filename = f"{base_filename}.png"
+        json_filename = f"{base_filename}.json"
+        blend_filename = f"{base_filename}.blend"
+
+        output_path = os.path.join(output_dir, filename)
+        json_path = os.path.join(output_dir, json_filename)
+        blend_path = os.path.join(output_dir, blend_filename)
+
+        # Check if files exist and find next available index
+        index = 1
+        while os.path.exists(output_path) or os.path.exists(json_path) or os.path.exists(blend_path):
+            filename = f"{base_filename}_{index}.png"
+            json_filename = f"{base_filename}_{index}.json"
+            blend_filename = f"{base_filename}_{index}.blend"
+
+            output_path = os.path.join(output_dir, filename)
+            json_path = os.path.join(output_dir, json_filename)
+            blend_path = os.path.join(output_dir, blend_filename)
+            index += 1
+
+        # Store paths for later use in export_data
+        self.output_path = output_path
+        self.json_path = json_path
+        self.blend_path = blend_path
+        self.original_filepath = scene.render.filepath
+
         # Set the render output path
-        original_filepath = scene.render.filepath
         scene.render.filepath = output_path
 
-        # Render the image with UI
+        # Register render handlers
+        bpy.app.handlers.render_complete.append(self.render_complete_handler)
+        bpy.app.handlers.render_cancel.append(self.render_cancel_handler)
+
+        # Start rendering
+        self._rendering = True
         bpy.ops.render.render('INVOKE_DEFAULT', write_still=True)
 
-        # Restore original filepath
-        scene.render.filepath = original_filepath
+        # Set up modal timer
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.1, window=context.window)
+        wm.modal_handler_add(self)
 
-        # Create JSON filename
-        json_filename = f"{work_name}_{frame_number:04d}.json"
-        json_path = os.path.join(output_dir, json_filename)
+        return {'RUNNING_MODAL'}
+
+    def render_complete_handler(self, scene, depsgraph):
+        # Mark rendering as complete
+        self._rendering = False
+        # Remove handler
+        bpy.app.handlers.render_complete.remove(self.render_complete_handler)
+
+    def render_cancel_handler(self, scene, depsgraph):
+        # Mark rendering as cancelled
+        self._rendering = False
+        # Remove handlers
+        if self.render_cancel_handler in bpy.app.handlers.render_cancel:
+            bpy.app.handlers.render_cancel.remove(self.render_cancel_handler)
+        if self.render_complete_handler in bpy.app.handlers.render_complete:
+            bpy.app.handlers.render_complete.remove(self.render_complete_handler)
+
+    def export_data(self, context):
+        scene = context.scene
+        camera = scene.camera
+
+        # Restore original filepath
+        scene.render.filepath = self.original_filepath
 
         # Export camera data
         cam_data = camera.data
@@ -303,23 +372,20 @@ class CAMERA_OT_RenderAndExport(Operator):
 
         # Write to JSON file
         try:
-            with open(json_path, 'w') as f:
+            with open(self.json_path, 'w') as f:
                 json.dump(export_data, f, indent=2)
-            self.report({'INFO'}, f"Camera data exported to {json_path}")
+            self.report({'INFO'}, f"Camera data exported to {self.json_path}")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to write camera data: {str(e)}")
-            return {'FINISHED'}  # Still return FINISHED since render was triggered
 
-        # Save blend file in the work directory
-        blend_filename = f"{work_name}_{frame_number:04d}.blend"
-        blend_path = os.path.join(output_dir, blend_filename)
+        # Save blend file in the work directory (using the same indexed filename)
         try:
-            bpy.ops.wm.save_as_mainfile(filepath=blend_path, copy=True)
-            self.report({'INFO'}, f"Blend file saved to {blend_path}")
+            bpy.ops.wm.save_as_mainfile(filepath=self.blend_path, copy=True)
+            self.report({'INFO'}, f"Blend file saved to {self.blend_path}")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to save blend file: {str(e)}")
 
-        return {'FINISHED'}
+        self.report({'INFO'}, f"Render complete: {self.output_path}")
 
 
 # ====== Registration ======
@@ -332,7 +398,7 @@ classes = (
 def register():
     """Called when add-on is enabled"""
     print("=" * 50)
-    print("Registering Camera Info Display Add-on")
+    print("Registering Render & Export Add-on")
     print("=" * 50)
 
     for cls in classes:
@@ -341,12 +407,12 @@ def register():
     # Register settings
     bpy.types.Scene.camera_export_settings = bpy.props.PointerProperty(type=CameraExportSettings)
 
-    print("Camera Info Display registered successfully")
-    print("   Access via: View3D > Sidebar > Camera Info tab")
+    print("Render & Export registered successfully")
+    print("   Access via: View3D > Sidebar > Render & Export tab")
 
 def unregister():
     """Called when add-on is disabled"""
-    print("Unregistering Camera Info Display Add-on")
+    print("Unregistering Render & Export Add-on")
 
     # Unregister settings
     del bpy.types.Scene.camera_export_settings
@@ -354,7 +420,7 @@ def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
-    print("Camera Info Display unregistered")
+    print("Render & Export unregistered")
 
 if __name__ == "__main__":
     register()
