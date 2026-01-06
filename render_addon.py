@@ -17,7 +17,7 @@ import struct
 import re
 import shutil
 from bpy.types import Panel, Operator, PropertyGroup
-from bpy.props import StringProperty, FloatProperty, BoolProperty
+from bpy.props import StringProperty, FloatProperty, BoolProperty, IntProperty
 from mathutils import Matrix, Vector, Quaternion
 
 
@@ -90,6 +90,40 @@ class CameraExportSettings(PropertyGroup):
         soft_min=0.0,
         soft_max=20.0,
         unit='LENGTH'
+    )
+
+    frame_min: IntProperty(
+        name="Frame Min",
+        description="Minimum frame number for random selection",
+        default=1,
+        min=0
+    )
+
+    frame_max: IntProperty(
+        name="Frame Max",
+        description="Maximum frame number for random selection",
+        default=250,
+        min=0
+    )
+
+    max_renders: IntProperty(
+        name="Max Renders",
+        description="Maximum number of renders (0 = unlimited)",
+        default=0,
+        min=0
+    )
+
+    is_loop_rendering: BoolProperty(
+        name="Loop Rendering Active",
+        description="Internal flag to track if loop render is active",
+        default=False
+    )
+
+    loop_render_count: IntProperty(
+        name="Loop Render Count",
+        description="Number of renders completed in current loop",
+        default=0,
+        min=0
     )
 
 
@@ -248,11 +282,282 @@ class CAMERA_PT_InfoPanel(Panel):
         random_box.separator()
         random_box.operator("camera.random_position", text="Randomize Camera Position", icon='FILE_REFRESH')
 
+        # Loop Render section
+        layout.separator()
+        loop_box = layout.box()
+        loop_box.label(text="Loop Random Render:", icon='RENDER_ANIMATION')
+
+        settings = context.scene.camera_export_settings
+
+        # Frame range controls
+        row = loop_box.row(align=True)
+        row.prop(settings, "frame_min")
+        row.prop(settings, "frame_max")
+
+        # Optional max renders
+        loop_box.prop(settings, "max_renders")
+
+        # Start/Stop buttons
+        loop_box.separator()
+        if settings.is_loop_rendering:
+            # Show stop button when active
+            row = loop_box.row()
+            row.scale_y = 1.5
+            row.alert = True
+            row.operator("camera.stop_loop_render", text="STOP Loop Render", icon='CANCEL')
+
+            # Show status with render count
+            status_row = loop_box.row()
+            status_row.label(text=f"Rendering... (Completed: {settings.loop_render_count})", icon='TIME')
+        else:
+            # Show start button when inactive
+            row = loop_box.row()
+            row.scale_y = 1.5
+            row.operator("camera.loop_render", text="Start Loop Render", icon='RENDER_ANIMATION')
+
+            # Show last count if any
+            if settings.loop_render_count > 0:
+                count_row = loop_box.row()
+                count_row.label(text=f"Last session: {settings.loop_render_count} renders", icon='INFO')
+
         # Render button
         layout.separator()
         render_box = layout.box()
         render_box.scale_y = 1.5
         render_box.operator("camera.render_and_export", text="Render Image", icon='RENDER_STILL')
+
+
+# ====== Helper Functions ======
+def downsample_ply(original_ply_path, output_ply_path, ratio, camera_data_json):
+    """Downsample original PLY file and embed camera/light data in header"""
+    try:
+        # Read original PLY file
+        with open(original_ply_path, 'rb') as f:
+            # Parse header
+            header_lines = []
+            vertex_count = 0
+            header_end_pos = 0
+
+            while True:
+                line = f.readline().decode('ascii').strip()
+                header_lines.append(line)
+
+                # Extract vertex count
+                if line.startswith('element vertex'):
+                    vertex_count = int(line.split()[-1])
+
+                # Check for end of header
+                if line == 'end_header':
+                    header_end_pos = f.tell()
+                    break
+
+            if vertex_count == 0:
+                return False, "No vertices found in PLY file"
+
+            # Calculate keep count
+            keep_count = max(1, int(vertex_count * ratio))
+
+            # Handle 100% ratio - just copy file with camera data added
+            if ratio >= 1.0 or keep_count == vertex_count:
+                # Read all vertex data
+                vertex_data = f.read(vertex_count * 27)  # 27 bytes per vertex
+
+                # Write output with camera data
+                write_ply_with_camera_data(output_ply_path, header_lines,
+                                          vertex_count, vertex_data, camera_data_json)
+                return True, f"PLY copied with camera data (100% of {vertex_count} points)"
+
+            # Random sampling
+            selected_indices = sorted(random.sample(range(vertex_count), keep_count))
+
+            # Read selected vertices
+            sampled_vertices = bytearray()
+            for idx in selected_indices:
+                f.seek(header_end_pos + idx * 27)
+                sampled_vertices.extend(f.read(27))
+
+            # Write downsampled PLY
+            write_ply_with_camera_data(output_ply_path, header_lines,
+                                       keep_count, bytes(sampled_vertices), camera_data_json)
+
+            return True, f"PLY downsampled: {vertex_count} → {keep_count} points ({ratio*100:.1f}%)"
+
+    except FileNotFoundError:
+        return False, f"Original PLY file not found: {original_ply_path}"
+    except Exception as e:
+        return False, f"Error downsampling PLY: {str(e)}"
+
+
+def write_ply_with_camera_data(output_path, header_lines, vertex_count, vertex_data, camera_data_json):
+    """Write PLY file with updated vertex count and embedded camera data"""
+    with open(output_path, 'wb') as f:
+        # Write header with modifications
+        for line in header_lines:
+            # Update vertex count
+            if line.startswith('element vertex'):
+                f.write(f'element vertex {vertex_count}\n'.encode('ascii'))
+            # Insert camera data comment before end_header
+            elif line == 'end_header':
+                f.write(f'comment camera_data: {camera_data_json}\n'.encode('ascii'))
+                f.write(b'end_header\n')
+            else:
+                f.write(f'{line}\n'.encode('ascii'))
+
+        # Write vertex data
+        f.write(vertex_data)
+
+
+def find_ply_for_frame(ply_directory, frame_number):
+    """Find PLY file matching the given frame number using same logic as PLYLoader"""
+    try:
+        # Get all .ply files in directory
+        ply_files = [f for f in os.listdir(ply_directory) if f.lower().endswith('.ply')]
+
+        for filename in ply_files:
+            # Extract frame number from filename (last numeric value)
+            # This matches the logic from ply_timeline_addon.py
+            numbers = re.findall(r'\d+', filename)
+            if numbers:
+                file_frame = int(numbers[-1])
+                if file_frame == frame_number:
+                    return os.path.join(ply_directory, filename)
+
+        return None
+    except Exception as e:
+        return None
+
+
+def export_render_data(context, output_path, json_path, blend_path, original_filepath):
+    """Export camera data, lights data, PLY file, and blend file after render completes"""
+    scene = context.scene
+    camera = scene.camera
+
+    # Restore original filepath
+    scene.render.filepath = original_filepath
+
+    # Export camera data
+    cam_data = camera.data
+
+    # Get camera position (Blender coordinates)
+    pos_blender = camera.location
+
+    # Get camera rotation as quaternion
+    if camera.rotation_mode == 'QUATERNION':
+        quaternion_blender = camera.rotation_quaternion.copy()
+    elif camera.rotation_mode == 'AXIS_ANGLE':
+        quaternion_blender = camera.rotation_axis_angle.to_quaternion()
+    else:
+        quaternion_blender = camera.rotation_euler.to_quaternion()
+
+    # Export lights data
+    lights_data = []
+    for obj in scene.objects:
+        if obj.type == 'LIGHT':
+            light_data_obj = obj.data
+
+            # Get light position (raw Blender coordinates)
+            light_pos_blender = obj.location
+            light_pos = {
+                "x": float(light_pos_blender.x),
+                "y": float(light_pos_blender.y),
+                "z": float(light_pos_blender.z)
+            }
+
+            # Get light rotation as quaternion (raw Blender quaternion)
+            if obj.rotation_mode == 'QUATERNION':
+                light_quat_blender = obj.rotation_quaternion.copy()
+            elif obj.rotation_mode == 'AXIS_ANGLE':
+                light_quat_blender = obj.rotation_axis_angle.to_quaternion()
+            else:
+                light_quat_blender = obj.rotation_euler.to_quaternion()
+
+            light_rot = {
+                "x": float(light_quat_blender.x),
+                "y": float(light_quat_blender.y),
+                "z": float(light_quat_blender.z),
+                "w": float(light_quat_blender.w)
+            }
+
+            # Get light properties
+            light_info = {
+                "name": obj.name,
+                "type": light_data_obj.type,  # POINT, SUN, SPOT, AREA
+                "position": light_pos,
+                "rotation": light_rot,
+                "energy": float(light_data_obj.energy),
+                "color": [float(c) for c in light_data_obj.color]
+            }
+
+            # Add type-specific properties
+            if light_data_obj.type == 'SPOT':
+                light_info["spot_size"] = float(light_data_obj.spot_size)
+                light_info["spot_blend"] = float(light_data_obj.spot_blend)
+
+            lights_data.append(light_info)
+
+    # Prepare JSON data
+    camera_data = {
+        "position": {
+            "x": float(pos_blender.x),
+            "y": float(pos_blender.y),
+            "z": float(pos_blender.z)
+        },
+        "rotation": {
+            "x": float(quaternion_blender.x),
+            "y": float(quaternion_blender.y),
+            "z": float(quaternion_blender.z),
+            "w": float(quaternion_blender.w)
+        },
+        "fov": float(cam_data.angle),
+        "frame": scene.frame_current,
+        "lights": lights_data
+    }
+
+    # Write JSON file
+    with open(json_path, 'w') as f:
+        json.dump(camera_data, f, indent=2)
+
+    # Save .blend file
+    bpy.ops.wm.save_as_mainfile(filepath=blend_path, copy=True, compress=True)
+
+    # Export PLY file with camera data if PLY Timeline addon is active
+    settings = scene.camera_export_settings
+    # Check if PLY settings exist (which means PLY addon is active)
+    if hasattr(scene, 'ply_timeline_settings'):
+        ply_settings = scene.ply_timeline_settings
+        ply_directory = bpy.path.abspath(ply_settings.ply_directory)
+
+        if ply_directory and os.path.isdir(ply_directory):
+            frame_number = scene.frame_current
+
+            # Find the PLY file for current frame
+            original_ply_path = find_ply_for_frame(ply_directory, frame_number)
+
+            if original_ply_path:
+                # Output PLY path
+                ply_filename = os.path.splitext(os.path.basename(output_path))[0] + '.ply'
+                output_ply_path = os.path.join(os.path.dirname(output_path), ply_filename)
+
+                # Downsample ratio from settings
+                ratio = settings.downsample_ratio
+
+                # Prepare camera data JSON string for PLY header
+                camera_data_json = json.dumps(camera_data, separators=(',', ':'))
+
+                # Downsample and export
+                success, message = downsample_ply(original_ply_path, output_ply_path,
+                                                  ratio, camera_data_json)
+
+                if success:
+                    print(f"[Export] PLY exported: {output_ply_path}")
+                else:
+                    print(f"[Export] PLY export failed: {message}")
+            else:
+                print(f"[Export] PLY file not found for frame {frame_number}")
+        else:
+            print(f"[Export] PLY directory not valid: {ply_directory}")
+    else:
+        print("[Export] PLY Timeline addon not active")
 
 
 # ====== Operators ======
@@ -367,251 +672,10 @@ class CAMERA_OT_RenderAndExport(Operator):
         if self.render_complete_handler in bpy.app.handlers.render_complete:
             bpy.app.handlers.render_complete.remove(self.render_complete_handler)
 
-    def downsample_ply(self, original_ply_path, output_ply_path, ratio, camera_data_json):
-        """Downsample original PLY file and embed camera/light data in header"""
-        try:
-            # Read original PLY file
-            with open(original_ply_path, 'rb') as f:
-                # Parse header
-                header_lines = []
-                vertex_count = 0
-                header_end_pos = 0
-
-                while True:
-                    line = f.readline().decode('ascii').strip()
-                    header_lines.append(line)
-
-                    # Extract vertex count
-                    if line.startswith('element vertex'):
-                        vertex_count = int(line.split()[-1])
-
-                    # Check for end of header
-                    if line == 'end_header':
-                        header_end_pos = f.tell()
-                        break
-
-                if vertex_count == 0:
-                    return False, "No vertices found in PLY file"
-
-                # Calculate keep count
-                keep_count = max(1, int(vertex_count * ratio))
-
-                # Handle 100% ratio - just copy file with camera data added
-                if ratio >= 1.0 or keep_count == vertex_count:
-                    # Read all vertex data
-                    vertex_data = f.read(vertex_count * 27)  # 27 bytes per vertex
-
-                    # Write output with camera data
-                    self._write_ply_with_camera_data(output_ply_path, header_lines,
-                                                     vertex_count, vertex_data, camera_data_json)
-                    return True, f"PLY copied with camera data (100% of {vertex_count} points)"
-
-                # Random sampling
-                selected_indices = sorted(random.sample(range(vertex_count), keep_count))
-
-                # Read selected vertices
-                sampled_vertices = bytearray()
-                for idx in selected_indices:
-                    f.seek(header_end_pos + idx * 27)
-                    sampled_vertices.extend(f.read(27))
-
-                # Write downsampled PLY
-                self._write_ply_with_camera_data(output_ply_path, header_lines,
-                                                 keep_count, bytes(sampled_vertices), camera_data_json)
-
-                return True, f"PLY downsampled: {vertex_count} → {keep_count} points ({ratio*100:.1f}%)"
-
-        except FileNotFoundError:
-            return False, f"Original PLY file not found: {original_ply_path}"
-        except Exception as e:
-            return False, f"Error downsampling PLY: {str(e)}"
-
-    def _write_ply_with_camera_data(self, output_path, header_lines, vertex_count, vertex_data, camera_data_json):
-        """Write PLY file with updated vertex count and embedded camera data"""
-        with open(output_path, 'wb') as f:
-            # Write header with modifications
-            for line in header_lines:
-                # Update vertex count
-                if line.startswith('element vertex'):
-                    f.write(f'element vertex {vertex_count}\n'.encode('ascii'))
-                # Insert camera data comment before end_header
-                elif line == 'end_header':
-                    f.write(f'comment camera_data: {camera_data_json}\n'.encode('ascii'))
-                    f.write(b'end_header\n')
-                else:
-                    f.write(f'{line}\n'.encode('ascii'))
-
-            # Write vertex data
-            f.write(vertex_data)
-
-    def _find_ply_for_frame(self, ply_directory, frame_number):
-        """Find PLY file matching the given frame number using same logic as PLYLoader"""
-        try:
-            # Get all .ply files in directory
-            ply_files = [f for f in os.listdir(ply_directory) if f.lower().endswith('.ply')]
-
-            for filename in ply_files:
-                # Extract frame number from filename (last numeric value)
-                # This matches the logic from ply_timeline_addon.py
-                numbers = re.findall(r'\d+', filename)
-                if numbers:
-                    file_frame = int(numbers[-1])
-                    if file_frame == frame_number:
-                        return os.path.join(ply_directory, filename)
-
-            return None
-        except Exception as e:
-            return None
-
     def export_data(self, context):
-        scene = context.scene
-        camera = scene.camera
-
-        # Restore original filepath
-        scene.render.filepath = self.original_filepath
-
-        # Export camera data
-        cam_data = camera.data
-
-        # Get camera position (Blender coordinates)
-        pos_blender = camera.location
-
-        # Get camera rotation as quaternion
-        if camera.rotation_mode == 'QUATERNION':
-            quaternion_blender = camera.rotation_quaternion.copy()
-        elif camera.rotation_mode == 'AXIS_ANGLE':
-            quaternion_blender = camera.rotation_axis_angle.to_quaternion()
-        else:
-            quaternion_blender = camera.rotation_euler.to_quaternion()
-
-
-        # Export lights data
-        lights_data = []
-        for obj in scene.objects:
-            if obj.type == 'LIGHT':
-                light_data_obj = obj.data
-
-                # Get light position (raw Blender coordinates)
-                light_pos_blender = obj.location
-                light_pos = {
-                    "x": float(light_pos_blender.x),
-                    "y": float(light_pos_blender.y),
-                    "z": float(light_pos_blender.z)
-                }
-
-                # Get light rotation as quaternion (raw Blender quaternion)
-                if obj.rotation_mode == 'QUATERNION':
-                    light_quat_blender = obj.rotation_quaternion.copy()
-                elif obj.rotation_mode == 'AXIS_ANGLE':
-                    light_quat_blender = obj.rotation_axis_angle.to_quaternion()
-                else:
-                    light_quat_blender = obj.rotation_euler.to_quaternion()
-
-                light_rot = {
-                    "x": float(light_quat_blender.x),
-                    "y": float(light_quat_blender.y),
-                    "z": float(light_quat_blender.z),
-                    "w": float(light_quat_blender.w)
-                }
-
-                # Get light properties
-                light_info = {
-                    "name": obj.name,
-                    "type": light_data_obj.type,  # POINT, SUN, SPOT, AREA
-                    "position": light_pos,
-                    "rotation": light_rot,
-                    "power": float(light_data_obj.energy),
-                    "color": {
-                        "r": float(light_data_obj.color[0]),
-                        "g": float(light_data_obj.color[1]),
-                        "b": float(light_data_obj.color[2])
-                    }
-                }
-
-                # Add type-specific properties
-                if light_data_obj.type == 'POINT':
-                    light_info["radius"] = float(light_data_obj.shadow_soft_size)
-                elif light_data_obj.type == 'AREA':
-                    light_info["size"] = float(light_data_obj.size)
-                    if light_data_obj.shape == 'RECTANGLE':
-                        light_info["size_y"] = float(light_data_obj.size_y)
-
-                lights_data.append(light_info)
-
-        # Create export data
-        export_data = {
-            "camera": {
-                "position": {
-                    "x": float(pos_blender.x),
-                    "y": float(pos_blender.y),
-                    "z": float(pos_blender.z)
-                },
-                "rotation": {
-                    "x": float(quaternion_blender.x),
-                    "y": float(quaternion_blender.y),
-                    "z": float(quaternion_blender.z),
-                    "w": float(quaternion_blender.w)
-                },
-                "fov": float(camera.data.angle)
-            },
-            "lights": lights_data
-        }
-
-        # Write to JSON file
-        try:
-            with open(self.json_path, 'w') as f:
-                json.dump(export_data, f, indent=2)
-            self.report({'INFO'}, f"Camera data exported to {self.json_path}")
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to write camera data: {str(e)}")
-
-        # Save blend file in the work directory (using the same indexed filename)
-        try:
-            bpy.ops.wm.save_as_mainfile(filepath=self.blend_path, copy=True)
-            self.report({'INFO'}, f"Blend file saved to {self.blend_path}")
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to save blend file: {str(e)}")
-
-        # Export downsampled PLY with embedded camera data if enabled
-        settings = scene.camera_export_settings
-        if settings.downsample_enabled:
-            # Check if PLY timeline addon is available
-            if hasattr(scene, 'ply_timeline_settings'):
-                ply_settings = scene.ply_timeline_settings
-                ply_directory = bpy.path.abspath(ply_settings.ply_directory)
-
-                if ply_directory and os.path.isdir(ply_directory):
-                    # Find PLY file for current frame
-                    current_frame = scene.frame_current
-                    original_ply_path = self._find_ply_for_frame(ply_directory, current_frame)
-
-                    if original_ply_path:
-                        # Generate output PLY filename (same base as render output)
-                        ply_base_filename = os.path.splitext(os.path.basename(self.output_path))[0]
-                        output_ply_path = os.path.join(os.path.dirname(self.output_path), f"{ply_base_filename}.ply")
-
-                        # Create compact JSON for embedding
-                        camera_data_json = json.dumps(export_data, separators=(',', ':'))
-
-                        # Downsample and export
-                        success, message = self.downsample_ply(
-                            original_ply_path,
-                            output_ply_path,
-                            settings.downsample_ratio,
-                            camera_data_json
-                        )
-
-                        if success:
-                            self.report({'INFO'}, f"PLY export: {message}")
-                        else:
-                            self.report({'WARNING'}, f"PLY export failed: {message}")
-                    else:
-                        self.report({'WARNING'}, f"No PLY file found for frame {current_frame}")
-                else:
-                    self.report({'WARNING'}, "PLY directory not set or invalid")
-            else:
-                self.report({'WARNING'}, "PLY timeline addon not active - cannot export PLY")
-
+        """Export all data after render completes"""
+        export_render_data(context, self.output_path, self.json_path,
+                          self.blend_path, self.original_filepath)
         self.report({'INFO'}, f"Render complete: {self.output_path}")
 
 
@@ -777,6 +841,11 @@ class CAMERA_OT_RandomPosition(Operator):
         flip = Quaternion((0, 1, 0), math.pi)
         camera.rotation_quaternion @= flip
 
+        # Randomize camera FOV (20-80 degrees)
+        fov_degrees = random.uniform(20, 80)
+        fov_radians = math.radians(fov_degrees)
+        camera.data.angle = fov_radians
+
         # Move lights with camera if enabled
         if settings.move_lights_with_camera:
             # Get all lights with saved relationships
@@ -821,12 +890,244 @@ class CAMERA_OT_RandomPosition(Operator):
         return {'FINISHED'}
 
 
+class CAMERA_OT_LoopRender(Operator):
+    """Continuously render random frames with random camera positions until stopped"""
+    bl_idname = "camera.loop_render"
+    bl_label = "Loop Random Render"
+    bl_description = "Randomly select frames and render with random camera positions until stopped"
+
+    _timer = None
+    _render_count = 0
+    _should_stop = False
+    _waiting_for_render = False
+    _output_dir = None
+    _render_complete_flag = False
+    _rendering = False
+
+    # Store paths for export after render
+    output_path = None
+    json_path = None
+    blend_path = None
+    original_filepath = None
+
+    def modal(self, context, event):
+        settings = context.scene.camera_export_settings
+
+        # Handle ESC key to stop
+        if event.type == 'ESC':
+            self.report({'INFO'}, f"Loop render cancelled by ESC - completed {self._render_count} renders")
+            return self.finish(context)
+
+        # Check stop button
+        if not settings.is_loop_rendering:
+            self.report({'INFO'}, f"Loop render stopped - completed {self._render_count} renders")
+            return self.finish(context)
+
+        if event.type == 'TIMER':
+            # If not waiting, start next iteration
+            if not self._waiting_for_render and not self._should_stop:
+                print(f"[Loop Render] Starting next render (count: {self._render_count})")
+                self.start_next_render(context)
+
+        return {'PASS_THROUGH'}
+
+    def render_complete_handler(self, scene, depsgraph=None):
+        """Called when render completes"""
+        print(f"[Loop Render] Render completion handler triggered")
+
+        # Get context
+        context = bpy.context
+
+        # Export data
+        print(f"[Loop Render] Exporting data...")
+        self.export_data_after_render(context)
+
+        # Update counters
+        self._waiting_for_render = False
+        self._render_count += 1
+        settings = context.scene.camera_export_settings
+        settings.loop_render_count = self._render_count
+
+        # Check if should stop
+        max_renders = settings.max_renders
+        if max_renders > 0 and self._render_count >= max_renders:
+            print(f"[Loop Render] Max renders reached, stopping")
+            settings.is_loop_rendering = False
+
+        # Remove the handler
+        try:
+            if self.render_complete_handler in bpy.app.handlers.render_complete:
+                bpy.app.handlers.render_complete.remove(self.render_complete_handler)
+        except Exception as e:
+            print(f"[Loop Render] Error removing handler: {e}")
+
+    def start_next_render(self, context):
+        """Select random frame, randomize camera, and start render"""
+        scene = context.scene
+        settings = scene.camera_export_settings
+
+        # Select random frame
+        frame_min = settings.frame_min
+        frame_max = settings.frame_max
+
+        if frame_min >= frame_max:
+            self.report({'ERROR'}, "Frame Min must be less than Frame Max")
+            return self.finish(context)
+
+        random_frame = random.randint(frame_min, frame_max)
+        scene.frame_set(random_frame)
+
+        # Randomize camera position
+        bpy.ops.camera.random_position()
+
+        # Prepare render paths (same logic as CAMERA_OT_RenderAndExport)
+        export_base_dir = bpy.path.abspath(settings.export_directory)
+        work_name = settings.work_name
+        frame_number = scene.frame_current
+
+        # Create output directory
+        output_dir = os.path.join(export_base_dir, work_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Find next available filename with index
+        base_filename = f"{work_name}_{frame_number:04d}"
+        filename = f"{base_filename}.png"
+        json_filename = f"{base_filename}.json"
+        blend_filename = f"{base_filename}.blend"
+
+        output_path = os.path.join(output_dir, filename)
+        json_path = os.path.join(output_dir, json_filename)
+        blend_path = os.path.join(output_dir, blend_filename)
+
+        # Find next available index if files exist
+        index = 1
+        while os.path.exists(output_path) or os.path.exists(json_path) or os.path.exists(blend_path):
+            filename = f"{base_filename}_{index}.png"
+            json_filename = f"{base_filename}_{index}.json"
+            blend_filename = f"{base_filename}_{index}.blend"
+
+            output_path = os.path.join(output_dir, filename)
+            json_path = os.path.join(output_dir, json_filename)
+            blend_path = os.path.join(output_dir, blend_filename)
+            index += 1
+
+        # Store paths for later export
+        self.output_path = output_path
+        self.json_path = json_path
+        self.blend_path = blend_path
+        self.original_filepath = scene.render.filepath
+
+        # Set render output path
+        scene.render.filepath = output_path
+
+        # Register render completion handler
+        # First, remove any existing handler to avoid duplicates
+        try:
+            while self.render_complete_handler in bpy.app.handlers.render_complete:
+                bpy.app.handlers.render_complete.remove(self.render_complete_handler)
+        except:
+            pass
+
+        # Now add the handler
+        bpy.app.handlers.render_complete.append(self.render_complete_handler)
+        print(f"[Loop Render] Registered render completion handler")
+
+        # Mark that we're waiting for render
+        self._waiting_for_render = True
+
+        # Use app.timers to delay render invocation slightly
+        # This allows the modal operator to yield control
+        def delayed_render():
+            bpy.ops.render.render('INVOKE_DEFAULT', write_still=True)
+            return None  # Don't repeat
+
+        bpy.app.timers.register(delayed_render, first_interval=0.1)
+        print(f"[Loop Render] Scheduled render to start")
+
+    def export_data_after_render(self, context):
+        """Export PLY, blend file, and JSON data after render completes"""
+        # Call standalone export function
+        export_render_data(context, self.output_path, self.json_path,
+                          self.blend_path, self.original_filepath)
+        print(f"[Loop Render] Export complete: {self.output_path}")
+
+    def finish(self, context):
+        """Clean up and finish"""
+        settings = context.scene.camera_export_settings
+        settings.is_loop_rendering = False
+        settings.loop_render_count = self._render_count
+
+        # Remove render completion handler if still registered
+        if self.render_complete_handler in bpy.app.handlers.render_complete:
+            bpy.app.handlers.render_complete.remove(self.render_complete_handler)
+
+        if self._timer:
+            try:
+                context.window_manager.event_timer_remove(self._timer)
+            except:
+                pass
+            self._timer = None
+
+        # Force UI update
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+        return {'FINISHED'}
+
+    def execute(self, context):
+        # Validate inputs
+        settings = context.scene.camera_export_settings
+
+        if context.scene.camera is None:
+            self.report({'ERROR'}, "No active camera")
+            return {'CANCELLED'}
+
+        if settings.frame_min >= settings.frame_max:
+            self.report({'ERROR'}, "Frame Min must be less than Frame Max")
+            return {'CANCELLED'}
+
+        # Initialize state
+        self._render_count = 0
+        self._should_stop = False
+        self._waiting_for_render = False
+        settings.is_loop_rendering = True
+        settings.loop_render_count = 0
+
+        # Set up timer to check every 1 second
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(1.0, window=context.window)
+        wm.modal_handler_add(self)
+
+        self.report({'INFO'}, "Loop render started")
+
+        # Start first render
+        self.start_next_render(context)
+
+        return {'RUNNING_MODAL'}
+
+
+class CAMERA_OT_StopLoopRender(Operator):
+    """Stop the loop rendering process"""
+    bl_idname = "camera.stop_loop_render"
+    bl_label = "Stop Loop Render"
+    bl_description = "Stop the active loop rendering"
+
+    def execute(self, context):
+        settings = context.scene.camera_export_settings
+        settings.is_loop_rendering = False
+        self.report({'INFO'}, "Loop render stop requested")
+        return {'FINISHED'}
+
+
 # ====== Registration ======
 classes = (
     CameraExportSettings,
     CAMERA_OT_RenderAndExport,
     CAMERA_OT_SaveLightRelationship,
     CAMERA_OT_RandomPosition,
+    CAMERA_OT_LoopRender,
+    CAMERA_OT_StopLoopRender,
     CAMERA_PT_InfoPanel,
 )
 
@@ -835,6 +1136,24 @@ def register():
     print("=" * 50)
     print("Registering Render & Export Add-on")
     print("=" * 50)
+
+    # Clean up any stale render handlers from previous addon crashes/reloads
+    try:
+        # Clear all render_complete handlers that might be stale
+        handlers_to_remove = []
+        for handler in bpy.app.handlers.render_complete:
+            handler_name = getattr(handler, '__name__', '')
+            if 'render_complete_handler' in handler_name:
+                handlers_to_remove.append(handler)
+
+        for handler in handlers_to_remove:
+            try:
+                bpy.app.handlers.render_complete.remove(handler)
+                print(f"   Cleaned up stale handler: {handler}")
+            except:
+                pass
+    except Exception as e:
+        print(f"   Note: Could not clean handlers: {e}")
 
     for cls in classes:
         bpy.utils.register_class(cls)
@@ -848,6 +1167,22 @@ def register():
 def unregister():
     """Called when add-on is disabled"""
     print("Unregistering Render & Export Add-on")
+
+    # Clean up any active handlers
+    try:
+        handlers_to_remove = []
+        for handler in bpy.app.handlers.render_complete:
+            handler_name = getattr(handler, '__name__', '')
+            if 'render_complete_handler' in handler_name:
+                handlers_to_remove.append(handler)
+
+        for handler in handlers_to_remove:
+            try:
+                bpy.app.handlers.render_complete.remove(handler)
+            except:
+                pass
+    except:
+        pass
 
     # Unregister settings
     del bpy.types.Scene.camera_export_settings
