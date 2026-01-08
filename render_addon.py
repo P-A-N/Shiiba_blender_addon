@@ -92,6 +92,17 @@ class CameraExportSettings(PropertyGroup):
         unit='LENGTH'
     )
 
+    target_down_offset: FloatProperty(
+        name="Target Down Offset",
+        description="Vertical offset to look below target point (meters)",
+        default=5.5,
+        min=0.0,
+        max=20.0,
+        soft_min=0.0,
+        soft_max=10.0,
+        unit='LENGTH'
+    )
+
     frame_min: IntProperty(
         name="Frame Min",
         description="Minimum frame number for random selection",
@@ -338,6 +349,7 @@ class CAMERA_PT_InfoPanel(Panel):
         random_box.prop(settings, "radius_near")
         random_box.prop(settings, "radius_far")
         random_box.prop(settings, "target_offset_max")
+        random_box.prop(settings, "target_down_offset")
 
         # Gaussian distribution settings
         random_box.separator()
@@ -638,12 +650,8 @@ def export_render_data(context, output_path, json_path, blend_path, original_fil
                 # Downsample ratio from settings
                 ratio = settings.downsample_ratio
 
-                # Prepare camera data JSON string for PLY header
-                camera_data_json = json.dumps(camera_data, separators=(',', ':'))
-
                 # Downsample and export
-                success, message = downsample_ply(original_ply_path, output_ply_path,
-                                                  ratio, camera_data_json)
+                success, message = downsample_ply(original_ply_path, output_ply_path, ratio)
 
                 if success:
                     print(f"[Export] PLY exported: {output_ply_path}")
@@ -948,11 +956,11 @@ class CAMERA_OT_RandomPosition(Operator):
             offset_y = offset_distance * math.sin(offset_phi) * math.sin(offset_theta)
             offset_z = offset_distance * math.cos(offset_phi)
 
-            # Always set target 7.5m down (subtract 7.5 from Z)
-            look_at_point = target_pos + Vector((offset_x, offset_y, offset_z - 7.5))
+            # Apply target down offset
+            look_at_point = target_pos + Vector((offset_x, offset_y, offset_z - settings.target_down_offset))
         else:
-            # Always set target 7.5m down (subtract 7.5 from Z)
-            look_at_point = target_pos + Vector((0, 0, -7.5))
+            # Apply target down offset
+            look_at_point = target_pos + Vector((0, 0, -settings.target_down_offset))
 
         # Calculate direction from camera to look-at point
         direction = look_at_point - camera.location

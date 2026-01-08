@@ -187,7 +187,14 @@ class PLYFrameHandler:
 
         # Clear and rebuild geometry
         self.mesh.clear_geometry()
-        positions = np.stack([data['x'], data['y'], data['z']], axis=1)
+
+        # Apply Unity to Blender coordinate transformation:
+        # Unity (x, y, z) -> Blender (x * 20, -z * 20, y * 20)
+        positions = np.stack([
+            data['x'] * 20,
+            -data['z'] * 20,
+            data['y'] * 20
+        ], axis=1)
         self.mesh.from_pydata(positions.tolist(), [], [])
         self.mesh.update()
 
@@ -205,8 +212,14 @@ class PLYFrameHandler:
         ], axis=1).astype(np.float32)
         color_attr.data.foreach_set("color", colors.ravel())
 
-        # Update velocity attributes
-        for name, arr in [('vx', data['vx']), ('vy', data['vy']), ('vz', data['vz'])]:
+        # Update velocity attributes with Unity to Blender transformation (rotation only, no scale)
+        # Unity (vx, vy, vz) -> Blender (vx, -vz, vy)
+        velocity_transformed = [
+            ('vx', data['vx']),
+            ('vy', -data['vz']),
+            ('vz', data['vy'])
+        ]
+        for name, arr in velocity_transformed:
             if name not in self.mesh.attributes:
                 attr = self.mesh.attributes.new(name=name, type='FLOAT', domain='POINT')
             else:
