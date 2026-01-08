@@ -97,7 +97,7 @@ class CameraExportSettings(PropertyGroup):
         description="Minimum frame number for random selection",
         default=1,
         min=0
-    )
+   )
 
     frame_max: IntProperty(
         name="Frame Max",
@@ -124,6 +124,78 @@ class CameraExportSettings(PropertyGroup):
         description="Number of renders completed in current loop",
         default=0,
         min=0
+    )
+
+    theta_center: FloatProperty(
+        name="Theta Center (degrees)",
+        description="Center value for theta (azimuthal angle) in degrees",
+        default=180.0,
+        min=0.0,
+        max=360.0,
+        soft_min=0.0,
+        soft_max=360.0
+    )
+
+    theta_std_dev: FloatProperty(
+        name="Theta Std Dev (degrees)",
+        description="Standard deviation for theta (azimuthal angle) in degrees",
+        default=60.0,
+        min=1.0,
+        max=180.0,
+        soft_min=10.0,
+        soft_max=90.0
+    )
+
+    phi_center: FloatProperty(
+        name="Phi Center (degrees)",
+        description="Center value for phi (polar angle) in degrees. 0°=top, 90°=horizon, 180°=bottom",
+        default=45.0,
+        min=0.0,
+        max=180.0,
+        soft_min=0.0,
+        soft_max=180.0
+    )
+
+    phi_std_dev: FloatProperty(
+        name="Phi Std Dev (degrees)",
+        description="Standard deviation for phi (polar angle) in degrees",
+        default=20.0,
+        min=1.0,
+        max=90.0,
+        soft_min=5.0,
+        soft_max=60.0
+    )
+
+    distance_adjustment_start: FloatProperty(
+        name="Distance Adjust Start (m)",
+        description="Distance where phi angle adjustment starts",
+        default=30.0,
+        min=0.0,
+        max=200.0,
+        soft_min=10.0,
+        soft_max=100.0,
+        unit='LENGTH'
+    )
+
+    distance_adjustment_end: FloatProperty(
+        name="Distance Adjust End (m)",
+        description="Distance where phi angle adjustment reaches maximum",
+        default=80.0,
+        min=0.0,
+        max=200.0,
+        soft_min=20.0,
+        soft_max=150.0,
+        unit='LENGTH'
+    )
+
+    phi_reduction_max: FloatProperty(
+        name="Max Phi Reduction (degrees)",
+        description="Maximum phi angle reduction at far distances (makes camera look more down)",
+        default=15.0,
+        min=0.0,
+        max=90.0,
+        soft_min=0.0,
+        soft_max=45.0
     )
 
 
@@ -267,6 +339,21 @@ class CAMERA_PT_InfoPanel(Panel):
         random_box.prop(settings, "radius_far")
         random_box.prop(settings, "target_offset_max")
 
+        # Gaussian distribution settings
+        random_box.separator()
+        random_box.label(text="Angle Distribution (Gaussian):", icon='DRIVER')
+        random_box.prop(settings, "theta_center")
+        random_box.prop(settings, "theta_std_dev")
+        random_box.prop(settings, "phi_center")
+        random_box.prop(settings, "phi_std_dev")
+
+        # Distance-based angle adjustment
+        random_box.separator()
+        random_box.label(text="Distance-Based Adjustment:", icon='ARROW_LEFTRIGHT')
+        random_box.prop(settings, "distance_adjustment_start")
+        random_box.prop(settings, "distance_adjustment_end")
+        random_box.prop(settings, "phi_reduction_max")
+
         # Light relationship controls
         random_box.separator()
         random_box.prop(settings, "move_lights_with_camera")
@@ -328,8 +415,8 @@ class CAMERA_PT_InfoPanel(Panel):
 
 
 # ====== Helper Functions ======
-def downsample_ply(original_ply_path, output_ply_path, ratio, camera_data_json):
-    """Downsample original PLY file and embed camera/light data in header"""
+def downsample_ply(original_ply_path, output_ply_path, ratio):
+    """Downsample original PLY file"""
     try:
         # Read original PLY file
         with open(original_ply_path, 'rb') as f:
@@ -357,15 +444,13 @@ def downsample_ply(original_ply_path, output_ply_path, ratio, camera_data_json):
             # Calculate keep count
             keep_count = max(1, int(vertex_count * ratio))
 
-            # Handle 100% ratio - just copy file with camera data added
+            # Handle 100% ratio - just copy file
             if ratio >= 1.0 or keep_count == vertex_count:
                 # Read all vertex data
                 vertex_data = f.read(vertex_count * 27)  # 27 bytes per vertex
 
-                # Write output with camera data
-                write_ply_with_camera_data(output_ply_path, header_lines,
-                                          vertex_count, vertex_data, camera_data_json)
-                return True, f"PLY copied with camera data (100% of {vertex_count} points)"
+                write_ply(output_ply_path, header_lines, vertex_count, vertex_data)
+                return True, f"PLY copied (100% of {vertex_count} points)"
 
             # Random sampling
             selected_indices = sorted(random.sample(range(vertex_count), keep_count))
@@ -377,8 +462,7 @@ def downsample_ply(original_ply_path, output_ply_path, ratio, camera_data_json):
                 sampled_vertices.extend(f.read(27))
 
             # Write downsampled PLY
-            write_ply_with_camera_data(output_ply_path, header_lines,
-                                       keep_count, bytes(sampled_vertices), camera_data_json)
+            write_ply(output_ply_path, header_lines, keep_count, bytes(sampled_vertices))
 
             return True, f"PLY downsampled: {vertex_count} → {keep_count} points ({ratio*100:.1f}%)"
 
@@ -388,17 +472,15 @@ def downsample_ply(original_ply_path, output_ply_path, ratio, camera_data_json):
         return False, f"Error downsampling PLY: {str(e)}"
 
 
-def write_ply_with_camera_data(output_path, header_lines, vertex_count, vertex_data, camera_data_json):
-    """Write PLY file with updated vertex count and embedded camera data"""
+def write_ply(output_path, header_lines, vertex_count, vertex_data):
+    """Write PLY file with updated vertex count"""
     with open(output_path, 'wb') as f:
         # Write header with modifications
         for line in header_lines:
             # Update vertex count
             if line.startswith('element vertex'):
                 f.write(f'element vertex {vertex_count}\n'.encode('ascii'))
-            # Insert camera data comment before end_header
             elif line == 'end_header':
-                f.write(f'comment camera_data: {camera_data_json}\n'.encode('ascii'))
                 f.write(b'end_header\n')
             else:
                 f.write(f'{line}\n'.encode('ascii'))
@@ -425,6 +507,18 @@ def find_ply_for_frame(ply_directory, frame_number):
         return None
     except Exception as e:
         return None
+
+
+def round_floats(obj, precision=10):
+    """Recursively round all float values in nested dicts/lists to specified precision"""
+    if isinstance(obj, float):
+        return round(obj, precision)
+    elif isinstance(obj, dict):
+        return {k: round_floats(v, precision) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [round_floats(item, precision) for item in obj]
+    else:
+        return obj
 
 
 def export_render_data(context, output_path, json_path, blend_path, original_filepath):
@@ -512,6 +606,9 @@ def export_render_data(context, output_path, json_path, blend_path, original_fil
         "frame": scene.frame_current,
         "lights": lights_data
     }
+
+    # Round all float values to 10 decimal places to reduce file size
+    camera_data = round_floats(camera_data, precision=10)
 
     # Write JSON file
     with open(json_path, 'w') as f:
@@ -612,7 +709,7 @@ class CAMERA_OT_RenderAndExport(Operator):
         os.makedirs(output_dir, exist_ok=True)
 
         # Find next available filename with index if file exists
-        base_filename = f"{work_name}_{frame_number:04d}"
+        base_filename = f"{work_name}_{frame_number:05d}"
         filename = f"{base_filename}.png"
         json_filename = f"{base_filename}.json"
         blend_filename = f"{base_filename}.blend"
@@ -780,12 +877,40 @@ class CAMERA_OT_RandomPosition(Operator):
         camera_pos = None
 
         while attempt < max_attempts:
-            # theta: azimuthal angle (0 to 2π) - rotation around Z axis
-            theta = random.uniform(0, 2 * math.pi)
-            # phi: polar angle (0 to π) - angle from Z axis
-            phi = random.uniform(0, math.pi)
             # distance: radial distance (from radius_near to radius_far)
             distance = random.uniform(radius_near, radius_far)
+
+            # theta: azimuthal angle (0 to 2π) - rotation around Z axis
+            # Use Gaussian distribution with user-defined center and std dev
+            theta_center_rad = math.radians(settings.theta_center)
+            theta_std_dev_rad = math.radians(settings.theta_std_dev)
+            theta = random.gauss(theta_center_rad, theta_std_dev_rad)
+            # Wrap theta to [0, 2π] range
+            theta = theta % (2 * math.pi)
+
+            # phi: polar angle (0 to π) - angle from Z axis
+            # Use Gaussian distribution with user-defined center and std dev
+            phi_center_rad = math.radians(settings.phi_center)
+            phi_std_dev_rad = math.radians(settings.phi_std_dev)
+
+            # Adjust phi based on distance: farther = lower angle (more top-down)
+            dist_start = settings.distance_adjustment_start
+            dist_end = settings.distance_adjustment_end
+            phi_reduction = settings.phi_reduction_max
+
+            if distance > dist_start and dist_end > dist_start:
+                # Linear interpolation from dist_start to dist_end
+                # At dist_start: 0 degree reduction
+                # At dist_end: phi_reduction degree reduction
+                distance_factor = min((distance - dist_start) / (dist_end - dist_start), 1.0)
+                phi_adjustment = math.radians(phi_reduction) * distance_factor
+                phi_center_rad = phi_center_rad - phi_adjustment
+                # Ensure phi_center_rad doesn't go below 0
+                phi_center_rad = max(0, phi_center_rad)
+
+            phi = random.gauss(phi_center_rad, phi_std_dev_rad)
+            # Clamp phi to [0, π] range
+            phi = max(0, min(math.pi, phi))
 
             # Convert polar to Cartesian coordinates
             x = distance * math.sin(phi) * math.cos(theta)
@@ -823,9 +948,11 @@ class CAMERA_OT_RandomPosition(Operator):
             offset_y = offset_distance * math.sin(offset_phi) * math.sin(offset_theta)
             offset_z = offset_distance * math.cos(offset_phi)
 
-            look_at_point = target_pos + Vector((offset_x, offset_y, offset_z))
+            # Always set target 7.5m down (subtract 7.5 from Z)
+            look_at_point = target_pos + Vector((offset_x, offset_y, offset_z - 7.5))
         else:
-            look_at_point = target_pos
+            # Always set target 7.5m down (subtract 7.5 from Z)
+            look_at_point = target_pos + Vector((0, 0, -7.5))
 
         # Calculate direction from camera to look-at point
         direction = look_at_point - camera.location
@@ -840,11 +967,6 @@ class CAMERA_OT_RandomPosition(Operator):
         # Flip 180 degrees because camera looks down -Z
         flip = Quaternion((0, 1, 0), math.pi)
         camera.rotation_quaternion @= flip
-
-        # Randomize camera FOV (20-80 degrees)
-        fov_degrees = random.uniform(20, 80)
-        fov_radians = math.radians(fov_degrees)
-        camera.data.angle = fov_radians
 
         # Move lights with camera if enabled
         if settings.move_lights_with_camera:
@@ -944,9 +1066,18 @@ class CAMERA_OT_LoopRender(Operator):
 
         # Defer export operations to after the render handler completes
         # This prevents "update requested during evaluation" errors
+        # IMPORTANT: Use longer delay (0.5s) to ensure depsgraph is fully stable
         def deferred_export():
             print(f"[Loop Render] Executing deferred export...")
             context = bpy.context
+
+            # Ensure we're not in the middle of a depsgraph evaluation
+            # by checking if any updates are pending
+            try:
+                # Force a complete view layer update first to flush pending operations
+                context.view_layer.update()
+            except Exception as e:
+                print(f"[Loop Render] View layer update warning: {e}")
 
             # Export data
             self.export_data_after_render(context)
@@ -966,7 +1097,8 @@ class CAMERA_OT_LoopRender(Operator):
             return None  # Don't repeat
 
         # Schedule export to happen after handler completes
-        bpy.app.timers.register(deferred_export, first_interval=0.1)
+        # Use longer delay (0.5s) to ensure depsgraph is fully stable before save
+        bpy.app.timers.register(deferred_export, first_interval=0.5)
 
     def start_next_render(self, context):
         """Select random frame, randomize camera, and start render"""
@@ -985,8 +1117,20 @@ class CAMERA_OT_LoopRender(Operator):
         # frame_set() triggers depsgraph update internally
         scene.frame_set(random_frame)
 
+        # Wait for depsgraph to stabilize after frame change
+        try:
+            context.view_layer.update()
+        except Exception as e:
+            print(f"[Loop Render] View layer update after frame_set warning: {e}")
+
         # Randomize camera position
         bpy.ops.camera.random_position()
+
+        # Ensure depsgraph is stable after camera move
+        try:
+            context.view_layer.update()
+        except Exception as e:
+            print(f"[Loop Render] View layer update after camera move warning: {e}")
 
         # Prepare render paths (same logic as CAMERA_OT_RenderAndExport)
         export_base_dir = bpy.path.abspath(settings.export_directory)
@@ -998,7 +1142,7 @@ class CAMERA_OT_LoopRender(Operator):
         os.makedirs(output_dir, exist_ok=True)
 
         # Find next available filename with index
-        base_filename = f"{work_name}_{frame_number:04d}"
+        base_filename = f"{work_name}_{frame_number:05d}"
         filename = f"{base_filename}.png"
         json_filename = f"{base_filename}.json"
         blend_filename = f"{base_filename}.blend"
@@ -1046,11 +1190,17 @@ class CAMERA_OT_LoopRender(Operator):
         # Use app.timers to delay render invocation
         # This allows depsgraph updates to complete and prevents race conditions
         def delayed_render():
+            # Final depsgraph stabilization before render
+            try:
+                bpy.context.view_layer.update()
+            except Exception as e:
+                print(f"[Loop Render] Pre-render view layer update warning: {e}")
             bpy.ops.render.render('INVOKE_DEFAULT', write_still=True)
             return None  # Don't repeat
 
-        bpy.app.timers.register(delayed_render, first_interval=0.5)
-        print(f"[Loop Render] Scheduled render to start")
+        # Use 1.0 second delay to ensure depsgraph is fully stable
+        bpy.app.timers.register(delayed_render, first_interval=1.0)
+        print(f"[Loop Render] Scheduled render to start (1s delay)")
 
     def export_data_after_render(self, context):
         """Export PLY, blend file, and JSON data after render completes"""
