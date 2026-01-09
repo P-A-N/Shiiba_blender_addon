@@ -121,6 +121,7 @@ class PLYFrameHandler:
 
     def __call__(self, scene, depsgraph=None):
         """Called automatically when timeline frame changes"""
+        global _global_handler
         current_frame = scene.frame_current
         print(f"[PLY Handler] Frame changed to: {current_frame}")
 
@@ -129,6 +130,9 @@ class PLYFrameHandler:
             print("[PLY Handler] Object reference is no longer valid, removing handler")
             if self in bpy.app.handlers.frame_change_post:
                 bpy.app.handlers.frame_change_post.remove(self)
+            # Clear global reference and update state
+            _global_handler = None
+            scene.ply_timeline_settings.is_active = False
             return
 
         # Skip if already loaded
