@@ -670,9 +670,9 @@ def export_render_data(context, output_path, json_path, blend_path, original_fil
             original_ply_path = find_ply_for_frame(ply_directory, frame_number)
 
             if original_ply_path:
-                # Output PLY path
-                ply_filename = os.path.splitext(os.path.basename(output_path))[0] + '.ply'
-                output_ply_path = os.path.join(os.path.dirname(output_path), ply_filename)
+                # Output PLY path - save to same directory as JSON (root export directory)
+                ply_filename = os.path.splitext(os.path.basename(json_path))[0] + '.ply'
+                output_ply_path = os.path.join(os.path.dirname(json_path), ply_filename)
 
                 # Downsample ratio from settings
                 ratio = settings.downsample_ratio
