@@ -209,6 +209,26 @@ class CameraExportSettings(PropertyGroup):
         soft_max=45.0
     )
 
+    fov_min: FloatProperty(
+        name="FOV Min (degrees)",
+        description="Minimum field of view for random camera",
+        default=20.0,
+        min=1.0,
+        max=179.0,
+        soft_min=10.0,
+        soft_max=120.0
+    )
+
+    fov_max: FloatProperty(
+        name="FOV Max (degrees)",
+        description="Maximum field of view for random camera",
+        default=80.0,
+        min=1.0,
+        max=179.0,
+        soft_min=10.0,
+        soft_max=120.0
+    )
+
 
 # ====== UI Panel ======
 class CAMERA_PT_InfoPanel(Panel):
@@ -350,6 +370,13 @@ class CAMERA_PT_InfoPanel(Panel):
         random_box.prop(settings, "radius_far")
         random_box.prop(settings, "target_offset_max")
         random_box.prop(settings, "target_down_offset")
+
+        # Random FOV settings
+        random_box.separator()
+        random_box.label(text="Random FOV:", icon='OUTLINER_OB_CAMERA')
+        row = random_box.row(align=True)
+        row.prop(settings, "fov_min")
+        row.prop(settings, "fov_max")
 
         # Gaussian distribution settings
         random_box.separator()
@@ -665,6 +692,30 @@ def export_render_data(context, output_path, json_path, blend_path, original_fil
         print("[Export] PLY Timeline addon not active")
 
 
+# ====== Render State (persistent across operator lifetime) ======
+_render_state = {
+    'rendering': False,
+    'cancelled': False,
+}
+
+def _render_complete_handler(scene, depsgraph):
+    """Handler called when render completes"""
+    _render_state['rendering'] = False
+    # Remove self from handlers
+    if _render_complete_handler in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.remove(_render_complete_handler)
+
+def _render_cancel_handler(scene, depsgraph):
+    """Handler called when render is cancelled"""
+    _render_state['rendering'] = False
+    _render_state['cancelled'] = True
+    # Remove handlers
+    if _render_cancel_handler in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.remove(_render_cancel_handler)
+    if _render_complete_handler in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.remove(_render_complete_handler)
+
+
 # ====== Operators ======
 class CAMERA_OT_RenderAndExport(Operator):
     """Render image and export camera data for Three.js"""
@@ -673,14 +724,14 @@ class CAMERA_OT_RenderAndExport(Operator):
     bl_description = "Render image and save camera data as JSON alongside the image"
 
     _timer = None
-    _rendering = False
 
     def modal(self, context, event):
         if event.type == 'TIMER':
-            # Check if rendering is complete
-            if not self._rendering:
+            # Check if rendering is complete using global state
+            if not _render_state['rendering']:
                 # Rendering finished, now export data
-                self.export_data(context)
+                if not _render_state['cancelled']:
+                    self.export_data(context)
                 self.cancel_timer(context)
                 return {'FINISHED'}
 
@@ -712,9 +763,12 @@ class CAMERA_OT_RenderAndExport(Operator):
 
         # Create output directory: export_directory/work_name/
         output_dir = os.path.join(export_base_dir, work_name)
+        # Create img subdirectory for PNG files
+        img_dir = os.path.join(output_dir, "img")
 
-        # Create directory if it doesn't exist
+        # Create directories if they don't exist
         os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(img_dir, exist_ok=True)
 
         # Find next available filename with index if file exists
         base_filename = f"{work_name}_{frame_number:05d}"
@@ -722,7 +776,7 @@ class CAMERA_OT_RenderAndExport(Operator):
         json_filename = f"{base_filename}.json"
         blend_filename = f"{base_filename}.blend"
 
-        output_path = os.path.join(output_dir, filename)
+        output_path = os.path.join(img_dir, filename)
         json_path = os.path.join(output_dir, json_filename)
         blend_path = os.path.join(output_dir, blend_filename)
 
@@ -733,7 +787,7 @@ class CAMERA_OT_RenderAndExport(Operator):
             json_filename = f"{base_filename}_{index}.json"
             blend_filename = f"{base_filename}_{index}.blend"
 
-            output_path = os.path.join(output_dir, filename)
+            output_path = os.path.join(img_dir, filename)
             json_path = os.path.join(output_dir, json_filename)
             blend_path = os.path.join(output_dir, blend_filename)
             index += 1
@@ -747,12 +801,13 @@ class CAMERA_OT_RenderAndExport(Operator):
         # Set the render output path
         scene.render.filepath = output_path
 
-        # Register render handlers
-        bpy.app.handlers.render_complete.append(self.render_complete_handler)
-        bpy.app.handlers.render_cancel.append(self.render_cancel_handler)
+        # Reset render state and register handlers
+        _render_state['rendering'] = True
+        _render_state['cancelled'] = False
+        bpy.app.handlers.render_complete.append(_render_complete_handler)
+        bpy.app.handlers.render_cancel.append(_render_cancel_handler)
 
         # Start rendering
-        self._rendering = True
         bpy.ops.render.render('INVOKE_DEFAULT', write_still=True)
 
         # Set up modal timer
@@ -761,21 +816,6 @@ class CAMERA_OT_RenderAndExport(Operator):
         wm.modal_handler_add(self)
 
         return {'RUNNING_MODAL'}
-
-    def render_complete_handler(self, scene, depsgraph):
-        # Mark rendering as complete
-        self._rendering = False
-        # Remove handler
-        bpy.app.handlers.render_complete.remove(self.render_complete_handler)
-
-    def render_cancel_handler(self, scene, depsgraph):
-        # Mark rendering as cancelled
-        self._rendering = False
-        # Remove handlers
-        if self.render_cancel_handler in bpy.app.handlers.render_cancel:
-            bpy.app.handlers.render_cancel.remove(self.render_cancel_handler)
-        if self.render_complete_handler in bpy.app.handlers.render_complete:
-            bpy.app.handlers.render_complete.remove(self.render_complete_handler)
 
     def export_data(self, context):
         """Export all data after render completes"""
@@ -976,6 +1016,14 @@ class CAMERA_OT_RandomPosition(Operator):
         flip = Quaternion((0, 1, 0), math.pi)
         camera.rotation_quaternion @= flip
 
+        # Randomize camera FOV
+        fov_min = settings.fov_min
+        fov_max = settings.fov_max
+        if fov_min < fov_max:
+            fov_degrees = random.uniform(fov_min, fov_max)
+            fov_radians = math.radians(fov_degrees)
+            camera.data.angle = fov_radians
+
         # Move lights with camera if enabled
         if settings.move_lights_with_camera:
             # Get all lights with saved relationships
@@ -983,8 +1031,29 @@ class CAMERA_OT_RandomPosition(Operator):
             moved_lights = 0
 
             for light in lights:
-                # Check if light has saved offset data
-                if ("camera_offset_x" in light and
+                # Check if this is a backlight (name contains "Back")
+                is_backlight = "back" in light.name.lower()
+
+                if is_backlight:
+                    # Backlight: place on opposite side of target from camera, 10m from target
+                    # Calculate direction from camera to target
+                    camera_to_target = target_pos - camera.location
+                    camera_to_target_normalized = camera_to_target.normalized()
+
+                    # Place backlight 10m beyond target (opposite side from camera)
+                    backlight_distance = 10.0
+                    light.location = target_pos + camera_to_target_normalized * backlight_distance
+
+                    # Make backlight face the target
+                    light_direction = target_pos - light.location
+                    light.rotation_mode = 'QUATERNION'
+                    light_rot_quat = light_direction.to_track_quat('-Z', 'Y')
+                    light.rotation_quaternion = light_rot_quat
+
+                    moved_lights += 1
+
+                # Check if light has saved offset data (for non-backlights)
+                elif ("camera_offset_x" in light and
                     "camera_offset_y" in light and
                     "camera_offset_z" in light):
 
@@ -1145,9 +1214,11 @@ class CAMERA_OT_LoopRender(Operator):
         work_name = settings.work_name
         frame_number = scene.frame_current
 
-        # Create output directory
+        # Create output directory and img subdirectory
         output_dir = os.path.join(export_base_dir, work_name)
+        img_dir = os.path.join(output_dir, "img")
         os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(img_dir, exist_ok=True)
 
         # Find next available filename with index
         base_filename = f"{work_name}_{frame_number:05d}"
@@ -1155,7 +1226,7 @@ class CAMERA_OT_LoopRender(Operator):
         json_filename = f"{base_filename}.json"
         blend_filename = f"{base_filename}.blend"
 
-        output_path = os.path.join(output_dir, filename)
+        output_path = os.path.join(img_dir, filename)
         json_path = os.path.join(output_dir, json_filename)
         blend_path = os.path.join(output_dir, blend_filename)
 
@@ -1166,7 +1237,7 @@ class CAMERA_OT_LoopRender(Operator):
             json_filename = f"{base_filename}_{index}.json"
             blend_filename = f"{base_filename}_{index}.blend"
 
-            output_path = os.path.join(output_dir, filename)
+            output_path = os.path.join(img_dir, filename)
             json_path = os.path.join(output_dir, json_filename)
             blend_path = os.path.join(output_dir, blend_filename)
             index += 1

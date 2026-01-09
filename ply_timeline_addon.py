@@ -109,10 +109,27 @@ class PLYFrameHandler:
         self.cache_size = cache_size
         self.current_loaded_frame = None
 
+    def is_valid(self):
+        """Check if the referenced Blender objects are still valid"""
+        try:
+            # Attempt to access a property to verify the object still exists
+            _ = self.obj.name
+            _ = self.mesh.name
+            return True
+        except ReferenceError:
+            return False
+
     def __call__(self, scene, depsgraph=None):
         """Called automatically when timeline frame changes"""
         current_frame = scene.frame_current
         print(f"[PLY Handler] Frame changed to: {current_frame}")
+
+        # Check if objects are still valid
+        if not self.is_valid():
+            print("[PLY Handler] Object reference is no longer valid, removing handler")
+            if self in bpy.app.handlers.frame_change_post:
+                bpy.app.handlers.frame_change_post.remove(self)
+            return
 
         # Skip if already loaded
         if current_frame == self.current_loaded_frame:
