@@ -137,6 +137,24 @@ class CameraExportSettings(PropertyGroup):
         min=0
     )
 
+    loop_waiting_for_render: BoolProperty(
+        name="Waiting for Render",
+        description="Internal flag to track if waiting for render to complete",
+        default=False
+    )
+
+    loop_render_pending: BoolProperty(
+        name="Render Pending",
+        description="Internal flag to track if render should start on next modal tick",
+        default=False
+    )
+
+    loop_render_start_time: FloatProperty(
+        name="Render Start Time",
+        description="Time when render was scheduled",
+        default=0.0
+    )
+
     theta_center: FloatProperty(
         name="Theta Center (degrees)",
         description="Center value for theta (azimuthal angle) in degrees",
@@ -1123,9 +1141,23 @@ class CAMERA_OT_LoopRender(Operator):
             return self.finish(context)
 
         if event.type == 'TIMER':
+            import time
+
+            # Check if render is pending and delay has passed (1 second)
+            if settings.loop_render_pending:
+                if time.time() - settings.loop_render_start_time >= 1.0:
+                    settings.loop_render_pending = False
+                    print(f"[Loop Render] Starting render now (from modal with valid context)")
+                    try:
+                        context.view_layer.update()
+                    except Exception as e:
+                        print(f"[Loop Render] Pre-render view layer update warning: {e}")
+                    bpy.ops.render.render('INVOKE_DEFAULT', write_still=True)
             # If not waiting, start next iteration
-            if not self._waiting_for_render and not self._should_stop:
-                print(f"[Loop Render] Starting next render (count: {self._render_count})")
+            # Use settings.loop_waiting_for_render instead of self._waiting_for_render
+            # because the deferred timer callback cannot access self
+            elif not settings.loop_waiting_for_render and not self._should_stop:
+                print(f"[Loop Render] Starting next render (count: {settings.loop_render_count})")
                 self.start_next_render(context)
 
         return {'PASS_THROUGH'}
@@ -1144,6 +1176,14 @@ class CAMERA_OT_LoopRender(Operator):
         # Defer export operations to after the render handler completes
         # This prevents "update requested during evaluation" errors
         # IMPORTANT: Use longer delay (0.5s) to ensure depsgraph is fully stable
+
+        # Capture all needed data as local variables before the timer fires
+        # The operator instance (self) may be deallocated by then
+        output_path = self.output_path
+        json_path = self.json_path
+        blend_path = self.blend_path
+        original_filepath = self.original_filepath
+
         def deferred_export():
             print(f"[Loop Render] Executing deferred export...")
             context = bpy.context
@@ -1156,20 +1196,24 @@ class CAMERA_OT_LoopRender(Operator):
             except Exception as e:
                 print(f"[Loop Render] View layer update warning: {e}")
 
-            # Export data
-            self.export_data_after_render(context)
+            # Export data using captured local variables
+            export_render_data(context, output_path, json_path,
+                              blend_path, original_filepath)
+            print(f"[Loop Render] Export complete: {output_path}")
 
-            # Update counters
-            self._waiting_for_render = False
-            self._render_count += 1
+            # Update counters via scene settings (not via self)
             settings = context.scene.camera_export_settings
-            settings.loop_render_count = self._render_count
+            settings.loop_render_count += 1
 
             # Check if should stop
             max_renders = settings.max_renders
-            if max_renders > 0 and self._render_count >= max_renders:
+            if max_renders > 0 and settings.loop_render_count >= max_renders:
                 print(f"[Loop Render] Max renders reached, stopping")
                 settings.is_loop_rendering = False
+
+            # Signal that we're ready for next render
+            settings.loop_waiting_for_render = False
+            print(f"[Loop Render] Ready for next render")
 
             return None  # Don't repeat
 
@@ -1265,21 +1309,14 @@ class CAMERA_OT_LoopRender(Operator):
 
         # Mark that we're waiting for render
         self._waiting_for_render = True
+        settings.loop_waiting_for_render = True
 
-        # Use app.timers to delay render invocation
-        # This allows depsgraph updates to complete and prevents race conditions
-        def delayed_render():
-            # Final depsgraph stabilization before render
-            try:
-                bpy.context.view_layer.update()
-            except Exception as e:
-                print(f"[Loop Render] Pre-render view layer update warning: {e}")
-            bpy.ops.render.render('INVOKE_DEFAULT', write_still=True)
-            return None  # Don't repeat
-
-        # Use 1.0 second delay to ensure depsgraph is fully stable
-        bpy.app.timers.register(delayed_render, first_interval=1.0)
-        print(f"[Loop Render] Scheduled render to start (1s delay)")
+        # Schedule render to start from modal loop (where we have valid context)
+        # Using a timer here causes "Python context internal state bug" errors
+        import time
+        settings.loop_render_pending = True
+        settings.loop_render_start_time = time.time()
+        print(f"[Loop Render] Scheduled render to start (1s delay, via modal)")
 
     def export_data_after_render(self, context):
         """Export PLY, blend file, and JSON data after render completes"""
@@ -1292,6 +1329,8 @@ class CAMERA_OT_LoopRender(Operator):
         """Clean up and finish"""
         settings = context.scene.camera_export_settings
         settings.is_loop_rendering = False
+        settings.loop_waiting_for_render = False
+        settings.loop_render_pending = False
         settings.loop_render_count = self._render_count
 
         # Remove render completion handler if still registered
@@ -1330,10 +1369,12 @@ class CAMERA_OT_LoopRender(Operator):
         self._waiting_for_render = False
         settings.is_loop_rendering = True
         settings.loop_render_count = 0
+        settings.loop_waiting_for_render = False
+        settings.loop_render_pending = False
 
-        # Set up timer to check every 1 second
+        # Set up timer to check every 0.1 second for responsive render scheduling
         wm = context.window_manager
-        self._timer = wm.event_timer_add(1.0, window=context.window)
+        self._timer = wm.event_timer_add(0.1, window=context.window)
         wm.modal_handler_add(self)
 
         self.report({'INFO'}, "Loop render started")
