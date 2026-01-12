@@ -11,8 +11,11 @@ bl_info = {
 import bpy
 import json
 import os
+import re
+import random
+import shutil
 from bpy.types import Panel, Operator, PropertyGroup
-from bpy.props import StringProperty, BoolProperty, IntProperty
+from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty
 from mathutils import Vector, Quaternion
 
 
@@ -33,9 +36,9 @@ class JSONRenderSettings(PropertyGroup):
     )
 
     # Batch rendering properties
-    image_directory: StringProperty(
-        name="Image Directory",
-        description="Directory containing rendered images (to find matching JSON files)",
+    json_directory: StringProperty(
+        name="JSON Directory",
+        description="Directory containing JSON files to batch render",
         default="",
         subtype='DIR_PATH'
     )
@@ -60,37 +63,176 @@ class JSONRenderSettings(PropertyGroup):
         min=0
     )
 
+    # JSON filter properties
+    filter_enabled: BoolProperty(
+        name="Filter by Prefix",
+        description="Only process JSON files starting with a specific string",
+        default=False
+    )
+
+    filter_prefix: StringProperty(
+        name="Filename Prefix",
+        description="Only process JSON files whose names start with this string",
+        default=""
+    )
+
+    # PLY downsample properties
+    downsample_enabled: BoolProperty(
+        name="Export Downsampled PLY",
+        description="Export a downsampled version of the PLY file",
+        default=False
+    )
+
+    downsample_ratio: FloatProperty(
+        name="Downsample Ratio",
+        description="Percentage of points to keep (e.g., 0.1 = 10%)",
+        default=0.1,
+        min=0.01,
+        max=1.0,
+        soft_min=0.01,
+        soft_max=1.0,
+        subtype='PERCENTAGE'
+    )
+
 
 # ====== Helper Functions ======
-def get_json_files_from_images(image_dir):
-    """Get JSON files by scanning PNG files in image directory.
+def downsample_ply(original_ply_path, output_ply_path, ratio):
+    """Downsample original PLY file"""
+    try:
+        # Read original PLY file
+        with open(original_ply_path, 'rb') as f:
+            # Parse header
+            header_lines = []
+            vertex_count = 0
+            header_end_pos = 0
 
-    - Only scans files directly in image_dir (ignores subdirectories)
-    - Converts XXXXX.png to XXXXX.json
-    - JSON files are in the parent directory of image_dir
+            while True:
+                line = f.readline().decode('ascii').strip()
+                header_lines.append(line)
+
+                # Extract vertex count
+                if line.startswith('element vertex'):
+                    vertex_count = int(line.split()[-1])
+
+                # Check for end of header
+                if line == 'end_header':
+                    header_end_pos = f.tell()
+                    break
+
+            if vertex_count == 0:
+                return False, "No vertices found in PLY file"
+
+            # Calculate keep count
+            keep_count = max(1, int(vertex_count * ratio))
+
+            # Handle 100% ratio - just copy file
+            if ratio >= 1.0 or keep_count == vertex_count:
+                # Read all vertex data
+                vertex_data = f.read(vertex_count * 27)  # 27 bytes per vertex
+
+                write_ply(output_ply_path, header_lines, vertex_count, vertex_data)
+                return True, f"PLY copied (100% of {vertex_count} points)"
+
+            # Random sampling
+            selected_indices = sorted(random.sample(range(vertex_count), keep_count))
+
+            # Read selected vertices
+            sampled_vertices = bytearray()
+            for idx in selected_indices:
+                f.seek(header_end_pos + idx * 27)
+                sampled_vertices.extend(f.read(27))
+
+            # Write downsampled PLY
+            write_ply(output_ply_path, header_lines, keep_count, bytes(sampled_vertices))
+
+            return True, f"PLY downsampled: {vertex_count} -> {keep_count} points ({ratio*100:.1f}%)"
+
+    except FileNotFoundError:
+        return False, f"Original PLY file not found: {original_ply_path}"
+    except Exception as e:
+        return False, f"Error downsampling PLY: {str(e)}"
+
+
+def write_ply(output_path, header_lines, vertex_count, vertex_data):
+    """Write PLY file with updated vertex count"""
+    with open(output_path, 'wb') as f:
+        # Write header with modifications
+        for line in header_lines:
+            # Update vertex count
+            if line.startswith('element vertex'):
+                f.write(f'element vertex {vertex_count}\n'.encode('ascii'))
+            elif line == 'end_header':
+                f.write(b'end_header\n')
+            else:
+                f.write(f'{line}\n'.encode('ascii'))
+
+        # Write vertex data
+        f.write(vertex_data)
+
+
+def find_ply_for_frame(ply_directory, frame_number):
+    """Find PLY file matching the given frame number using same logic as PLYLoader"""
+    try:
+        # Get all .ply files in directory
+        ply_files = [f for f in os.listdir(ply_directory) if f.lower().endswith('.ply')]
+
+        for filename in ply_files:
+            # Extract frame number from filename (last numeric value)
+            # This matches the logic from ply_timeline_addon.py
+            numbers = re.findall(r'\d+', filename)
+            if numbers:
+                file_frame = int(numbers[-1])
+                if file_frame == frame_number:
+                    return os.path.join(ply_directory, filename)
+
+        return None
+    except Exception as e:
+        return None
+
+
+def get_json_files_from_directory(json_dir, filter_prefix=None):
+    """Get JSON files from a directory.
+
+    - Only scans files directly in json_dir (ignores subdirectories)
+    - If filter_prefix is provided, only include JSON files starting with that prefix
     """
-    image_path = bpy.path.abspath(image_dir)
-    if not os.path.isdir(image_path):
+    json_path = bpy.path.abspath(json_dir)
+    if not os.path.isdir(json_path):
         return []
 
-    # Get parent directory where JSON files are located
-    parent_dir = os.path.dirname(image_path.rstrip(os.sep))
-
     json_files = []
-    for item in os.listdir(image_path):
-        item_path = os.path.join(image_path, item)
-        # Only process files (not directories) that are PNG
-        if os.path.isfile(item_path) and item.lower().endswith('.png'):
-            # Convert image name to JSON name
-            base_name = os.path.splitext(item)[0]
-            json_filename = f"{base_name}.json"
-            json_path = os.path.join(parent_dir, json_filename)
-
-            # Only add if JSON file exists
-            if os.path.exists(json_path):
-                json_files.append(json_path)
+    for item in os.listdir(json_path):
+        item_path = os.path.join(json_path, item)
+        # Only process files (not directories) that are JSON
+        if os.path.isfile(item_path) and item.lower().endswith('.json'):
+            # Apply prefix filter if specified
+            if filter_prefix:
+                if not item.startswith(filter_prefix):
+                    continue
+            json_files.append(item_path)
 
     return sorted(json_files)
+
+
+def copy_json_to_output(json_path, output_dir):
+    """Copy JSON file to output directory.
+
+    Args:
+        json_path: Source JSON file path
+        output_dir: Destination directory
+
+    Returns:
+        (success, message) tuple
+    """
+    try:
+        json_filename = os.path.basename(json_path)
+        output_json_path = os.path.join(output_dir, json_filename)
+        shutil.copy2(json_path, output_json_path)
+        print(f"[JSON Render] JSON copied: {output_json_path}")
+        return True, f"JSON copied to {output_json_path}"
+    except Exception as e:
+        print(f"[JSON Render] JSON copy failed: {str(e)}")
+        return False, f"Error copying JSON: {str(e)}"
 
 
 def apply_json_to_scene(context, json_path):
@@ -168,6 +310,63 @@ def apply_json_to_scene(context, json_path):
     return True, "JSON applied successfully"
 
 
+def export_ply_for_json(context, json_path, output_dir):
+    """Export downsampled PLY file for a JSON file.
+
+    Args:
+        context: Blender context
+        json_path: Path to the JSON file (used to get frame number and output name)
+        output_dir: Directory where PLY will be saved
+
+    Returns:
+        (success, message) tuple
+    """
+    scene = context.scene
+    settings = scene.json_render_settings
+
+    # Check if downsample is enabled
+    if not settings.downsample_enabled:
+        return True, "PLY export disabled"
+
+    # Check if PLY Timeline addon is active
+    if not hasattr(scene, 'ply_timeline_settings'):
+        return False, "PLY Timeline addon not active"
+
+    ply_settings = scene.ply_timeline_settings
+    ply_directory = bpy.path.abspath(ply_settings.ply_directory)
+
+    if not ply_directory or not os.path.isdir(ply_directory):
+        return False, f"PLY directory not valid: {ply_directory}"
+
+    # Read frame number from JSON
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+        frame_number = data.get("frame", scene.frame_current)
+    except Exception as e:
+        return False, f"Error reading JSON for frame: {str(e)}"
+
+    # Find PLY file for this frame
+    original_ply_path = find_ply_for_frame(ply_directory, frame_number)
+    if not original_ply_path:
+        return False, f"PLY file not found for frame {frame_number}"
+
+    # Output PLY path - use same base name as JSON
+    ply_filename = os.path.splitext(os.path.basename(json_path))[0] + '.ply'
+    output_ply_path = os.path.join(output_dir, ply_filename)
+
+    # Downsample and export
+    ratio = settings.downsample_ratio
+    success, message = downsample_ply(original_ply_path, output_ply_path, ratio)
+
+    if success:
+        print(f"[JSON Render] PLY exported: {output_ply_path}")
+    else:
+        print(f"[JSON Render] PLY export failed: {message}")
+
+    return success, message
+
+
 # ====== UI Panel ======
 class JSONRENDER_PT_MainPanel(Panel):
     """Panel for JSON Camera Render addon"""
@@ -219,16 +418,30 @@ class JSONRENDER_PT_MainPanel(Panel):
         row.scale_y = 1.5
         row.operator("json_render.render", text="Render", icon='RENDER_STILL')
 
+        # PLY Downsample section
+        layout.separator()
+        ply_box = layout.box()
+        ply_box.label(text="PLY Downsample:", icon='MESH_DATA')
+        ply_box.prop(settings, "downsample_enabled")
+        if settings.downsample_enabled:
+            ply_box.prop(settings, "downsample_ratio", slider=True)
+
         # Batch Render section
         layout.separator()
         batch_box = layout.box()
         batch_box.label(text="Batch Render:", icon='RENDER_ANIMATION')
 
-        # Image directory selector
-        batch_box.prop(settings, "image_directory", text="Image Dir")
+        # JSON directory selector
+        batch_box.prop(settings, "json_directory", text="JSON Dir")
 
-        # Show JSON file count
-        json_files = get_json_files_from_images(settings.image_directory)
+        # JSON filter settings
+        batch_box.prop(settings, "filter_enabled")
+        if settings.filter_enabled:
+            batch_box.prop(settings, "filter_prefix", text="Prefix")
+
+        # Show JSON file count (with filter applied)
+        filter_prefix = settings.filter_prefix if settings.filter_enabled else None
+        json_files = get_json_files_from_directory(settings.json_directory, filter_prefix)
         batch_box.label(text=f"Found {len(json_files)} JSON file(s)", icon='FILE')
 
         # Batch render controls
@@ -357,6 +570,8 @@ class JSONRENDER_OT_BatchRender(Operator):
     _json_files = []
     _current_index = 0
     _waiting_for_render = False
+    _current_json_path = None
+    _output_dir = None
 
     def modal(self, context, event):
         settings = context.scene.json_render_settings
@@ -412,6 +627,10 @@ class JSONRENDER_OT_BatchRender(Operator):
         # Set render output path
         scene.render.filepath = output_path
 
+        # Store current json_path and output_dir for PLY export after render
+        self._current_json_path = json_path
+        self._output_dir = output_dir
+
         # Mark as waiting and register completion handler
         self._waiting_for_render = True
         bpy.app.handlers.render_complete.append(self.render_complete_handler)
@@ -428,9 +647,22 @@ class JSONRENDER_OT_BatchRender(Operator):
         if self.render_cancel_handler in bpy.app.handlers.render_cancel:
             bpy.app.handlers.render_cancel.remove(self.render_cancel_handler)
 
-        # Schedule next render
+        # Capture paths for deferred export
+        current_json_path = self._current_json_path
+        output_dir = self._output_dir
+
+        # Schedule JSON copy, PLY export and next render
         def deferred_next():
-            settings = bpy.context.scene.json_render_settings
+            context = bpy.context
+            settings = context.scene.json_render_settings
+
+            if current_json_path and output_dir:
+                # Copy JSON file to output directory
+                copy_json_to_output(current_json_path, output_dir)
+
+                # Export PLY if enabled
+                export_ply_for_json(context, current_json_path, output_dir)
+
             self._current_index += 1
             settings.batch_render_count = self._current_index
             self._waiting_for_render = False
@@ -487,11 +719,12 @@ class JSONRENDER_OT_BatchRender(Operator):
             self.report({'ERROR'}, "No active camera in scene")
             return {'CANCELLED'}
 
-        # Get JSON files from image directory
-        self._json_files = get_json_files_from_images(settings.image_directory)
+        # Get JSON files from directory (with filter if enabled)
+        filter_prefix = settings.filter_prefix if settings.filter_enabled else None
+        self._json_files = get_json_files_from_directory(settings.json_directory, filter_prefix)
 
         if not self._json_files:
-            self.report({'ERROR'}, "No JSON files found from image directory")
+            self.report({'ERROR'}, "No JSON files found in directory")
             return {'CANCELLED'}
 
         # Initialize state
