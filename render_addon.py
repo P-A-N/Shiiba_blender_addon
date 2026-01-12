@@ -155,6 +155,12 @@ class CameraExportSettings(PropertyGroup):
         default=0.0
     )
 
+    loop_export_pending: BoolProperty(
+        name="Export Pending",
+        description="Internal flag to track if export should run on next modal tick",
+        default=False
+    )
+
     theta_center: FloatProperty(
         name="Theta Center (degrees)",
         description="Center value for theta (azimuthal angle) in degrees",
@@ -582,13 +588,10 @@ def round_floats(obj, precision=10):
         return obj
 
 
-def export_render_data(context, output_path, json_path, blend_path, original_filepath):
+def export_render_data(context, output_path, json_path, blend_path):
     """Export camera data, lights data, PLY file, and blend file after render completes"""
     scene = context.scene
     camera = scene.camera
-
-    # Restore original filepath
-    scene.render.filepath = original_filepath
 
     # Export camera data
     cam_data = camera.data
@@ -842,7 +845,9 @@ class CAMERA_OT_RenderAndExport(Operator):
     def export_data(self, context):
         """Export all data after render completes"""
         export_render_data(context, self.output_path, self.json_path,
-                          self.blend_path, self.original_filepath)
+                          self.blend_path)
+        # Restore original filepath
+        context.scene.render.filepath = self.original_filepath
         self.report({'INFO'}, f"Render complete: {self.output_path}")
 
 
@@ -1111,6 +1116,12 @@ class CAMERA_OT_RandomPosition(Operator):
         return {'FINISHED'}
 
 
+# Module-level state for loop render (avoids Blender's restricted context issues)
+_loop_render_state = {
+    'export_pending': False,
+}
+
+
 class CAMERA_OT_LoopRender(Operator):
     """Continuously render random frames with random camera positions until stopped"""
     bl_idname = "camera.loop_render"
@@ -1147,8 +1158,35 @@ class CAMERA_OT_LoopRender(Operator):
         if event.type == 'TIMER':
             import time
 
+            # Check if export is pending (render completed, need to export from modal context)
+            # Use module-level state to avoid Blender's restricted context issues
+            if _loop_render_state['export_pending']:
+                _loop_render_state['export_pending'] = False
+                print(f"[Loop Render] Executing export from modal context...")
+
+                # Perform export (safe in modal context)
+                export_render_data(context, self.output_path, self.json_path, self.blend_path)
+                print(f"[Loop Render] Export complete: {self.output_path}")
+
+                # Restore original filepath
+                context.scene.render.filepath = self.original_filepath
+
+                # Update counters
+                settings.loop_render_count += 1
+                self._render_count = settings.loop_render_count
+
+                # Check if should stop
+                max_renders = settings.max_renders
+                if max_renders > 0 and settings.loop_render_count >= max_renders:
+                    print(f"[Loop Render] Max renders reached, stopping")
+                    settings.is_loop_rendering = False
+
+                # Signal that we're ready for next render
+                settings.loop_waiting_for_render = False
+                print(f"[Loop Render] Ready for next render")
+
             # Check if render is pending and delay has passed (1 second)
-            if settings.loop_render_pending:
+            elif settings.loop_render_pending:
                 if time.time() - settings.loop_render_start_time >= 1.0:
                     settings.loop_render_pending = False
                     print(f"[Loop Render] Starting render now (from modal with valid context)")
@@ -1177,53 +1215,10 @@ class CAMERA_OT_LoopRender(Operator):
         except Exception as e:
             print(f"[Loop Render] Error removing handler: {e}")
 
-        # Defer export operations to after the render handler completes
-        # This prevents "update requested during evaluation" errors
-        # IMPORTANT: Use longer delay (0.5s) to ensure depsgraph is fully stable
-
-        # Capture all needed data as local variables before the timer fires
-        # The operator instance (self) may be deallocated by then
-        output_path = self.output_path
-        json_path = self.json_path
-        blend_path = self.blend_path
-        original_filepath = self.original_filepath
-
-        def deferred_export():
-            print(f"[Loop Render] Executing deferred export...")
-            context = bpy.context
-
-            # Ensure we're not in the middle of a depsgraph evaluation
-            # by checking if any updates are pending
-            try:
-                # Force a complete view layer update first to flush pending operations
-                context.view_layer.update()
-            except Exception as e:
-                print(f"[Loop Render] View layer update warning: {e}")
-
-            # Export data using captured local variables
-            export_render_data(context, output_path, json_path,
-                              blend_path, original_filepath)
-            print(f"[Loop Render] Export complete: {output_path}")
-
-            # Update counters via scene settings (not via self)
-            settings = context.scene.camera_export_settings
-            settings.loop_render_count += 1
-
-            # Check if should stop
-            max_renders = settings.max_renders
-            if max_renders > 0 and settings.loop_render_count >= max_renders:
-                print(f"[Loop Render] Max renders reached, stopping")
-                settings.is_loop_rendering = False
-
-            # Signal that we're ready for next render
-            settings.loop_waiting_for_render = False
-            print(f"[Loop Render] Ready for next render")
-
-            return None  # Don't repeat
-
-        # Schedule export to happen after handler completes
-        # Use longer delay (0.5s) to ensure depsgraph is fully stable before save
-        bpy.app.timers.register(deferred_export, first_interval=0.5)
+        # Signal the modal to perform export on next tick
+        # Use module-level state because we cannot write to Blender ID classes in this context
+        _loop_render_state['export_pending'] = True
+        print(f"[Loop Render] Export pending flag set, modal will handle export")
 
     def start_next_render(self, context):
         """Select random frame, randomize camera, and start render"""
@@ -1326,7 +1321,9 @@ class CAMERA_OT_LoopRender(Operator):
         """Export PLY, blend file, and JSON data after render completes"""
         # Call standalone export function
         export_render_data(context, self.output_path, self.json_path,
-                          self.blend_path, self.original_filepath)
+                          self.blend_path)
+        # Restore original filepath
+        context.scene.render.filepath = self.original_filepath
         print(f"[Loop Render] Export complete: {self.output_path}")
 
     def finish(self, context):
@@ -1335,6 +1332,7 @@ class CAMERA_OT_LoopRender(Operator):
         settings.is_loop_rendering = False
         settings.loop_waiting_for_render = False
         settings.loop_render_pending = False
+        _loop_render_state['export_pending'] = False
         settings.loop_render_count = self._render_count
 
         # Remove render completion handler if still registered
@@ -1375,6 +1373,7 @@ class CAMERA_OT_LoopRender(Operator):
         settings.loop_render_count = 0
         settings.loop_waiting_for_render = False
         settings.loop_render_pending = False
+        _loop_render_state['export_pending'] = False
 
         # Set up timer to check every 0.1 second for responsive render scheduling
         wm = context.window_manager
