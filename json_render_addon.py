@@ -613,9 +613,20 @@ class JSONRENDER_OT_BatchRender(Operator):
     _waiting_for_render = False
     _current_json_path = None
     _output_dir = None
+    _needs_count_update = False
+    _render_cancelled = False
 
     def modal(self, context, event):
         settings = context.scene.json_render_settings
+
+        # Handle deferred property updates from timer callbacks
+        if self._needs_count_update:
+            settings.batch_render_count = self._current_index
+            self._needs_count_update = False
+
+        if self._render_cancelled:
+            settings.is_batch_rendering = False
+            self._render_cancelled = False
 
         # Check for stop
         if not settings.is_batch_rendering:
@@ -695,7 +706,6 @@ class JSONRENDER_OT_BatchRender(Operator):
         # Schedule JSON copy, PLY export and next render
         def deferred_next():
             context = bpy.context
-            settings = context.scene.json_render_settings
 
             if current_json_path and output_dir:
                 # Copy JSON file to output directory
@@ -705,7 +715,8 @@ class JSONRENDER_OT_BatchRender(Operator):
                 export_ply_for_json(context, current_json_path, output_dir)
 
             self._current_index += 1
-            settings.batch_render_count = self._current_index
+            # Use flag instead of direct property write (not allowed in timer context)
+            self._needs_count_update = True
             self._waiting_for_render = False
             return None
 
@@ -719,10 +730,9 @@ class JSONRENDER_OT_BatchRender(Operator):
         if self.render_cancel_handler in bpy.app.handlers.render_cancel:
             bpy.app.handlers.render_cancel.remove(self.render_cancel_handler)
 
-        # Stop batch
+        # Stop batch - use flag instead of direct property write (not allowed in timer context)
         def deferred_stop():
-            settings = bpy.context.scene.json_render_settings
-            settings.is_batch_rendering = False
+            self._render_cancelled = True
             self._waiting_for_render = False
             return None
 
