@@ -126,12 +126,24 @@ def downsample_ply(original_ply_path, output_ply_path, ratio):
             keep_count = max(1, int(vertex_count * ratio))
 
             # Handle 100% ratio - just copy file
-            if ratio >= 1.0 or keep_count == vertex_count:
-                # Read all vertex data
-                vertex_data = f.read(vertex_count * 27)  # 27 bytes per vertex
+            if ratio >= 1.0 or keep_count >= vertex_count:
+                # Calculate bytes per vertex from file size
+                f.seek(0, 2)  # Seek to end
+                file_size = f.tell()
+                vertex_data_size = file_size - header_end_pos
+                bytes_per_vertex = vertex_data_size // vertex_count
+
+                f.seek(header_end_pos)
+                vertex_data = f.read()
 
                 write_ply(output_ply_path, header_lines, vertex_count, vertex_data)
                 return True, f"PLY copied (100% of {vertex_count} points)"
+
+            # Calculate bytes per vertex from file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            vertex_data_size = file_size - header_end_pos
+            bytes_per_vertex = vertex_data_size // vertex_count
 
             # Random sampling
             selected_indices = sorted(random.sample(range(vertex_count), keep_count))
@@ -139,8 +151,8 @@ def downsample_ply(original_ply_path, output_ply_path, ratio):
             # Read selected vertices
             sampled_vertices = bytearray()
             for idx in selected_indices:
-                f.seek(header_end_pos + idx * 27)
-                sampled_vertices.extend(f.read(27))
+                f.seek(header_end_pos + idx * bytes_per_vertex)
+                sampled_vertices.extend(f.read(bytes_per_vertex))
 
             # Write downsampled PLY
             write_ply(output_ply_path, header_lines, keep_count, bytes(sampled_vertices))
@@ -459,11 +471,40 @@ class JSONRENDER_PT_MainPanel(Panel):
                 row.scale_y = 1.5
                 row.operator("json_render.batch_render", text=f"Start Batch Render ({len(json_files)})", icon='RENDER_ANIMATION')
             else:
-                batch_box.label(text="Set image directory to find JSON files", icon='INFO')
+                batch_box.label(text="Set JSON directory to find files", icon='INFO')
 
             # Show last batch count
             if settings.batch_render_count > 0:
                 batch_box.label(text=f"Last batch: {settings.batch_render_count} renders", icon='INFO')
+
+        # Generate Downsampled PLY section
+        layout.separator()
+        ply_gen_box = layout.box()
+        ply_gen_box.label(text="Generate Downsampled PLY:", icon='MESH_DATA')
+
+        # Downsample ratio
+        ply_gen_box.prop(settings, "downsample_ratio", text="Ratio", slider=True)
+
+        # Check if PLY Timeline addon is available
+        if hasattr(scene, 'ply_timeline_settings'):
+            ply_settings = scene.ply_timeline_settings
+            ply_dir = bpy.path.abspath(ply_settings.ply_directory)
+
+            if ply_dir and os.path.isdir(ply_dir):
+                ply_gen_box.label(text=f"Source: {os.path.basename(ply_dir.rstrip(os.sep))}", icon='FILE_FOLDER')
+
+                json_dir = bpy.path.abspath(settings.json_directory)
+                json_dir_files = get_json_files_from_directory(settings.json_directory, filter_prefix)
+                if json_dir and os.path.isdir(json_dir) and len(json_dir_files) > 0:
+                    row = ply_gen_box.row()
+                    row.scale_y = 1.5
+                    row.operator("json_render.generate_downsampled_ply", text=f"Generate PLYs ({len(json_dir_files)})", icon='EXPORT')
+                else:
+                    ply_gen_box.label(text="Set JSON Directory above", icon='INFO')
+            else:
+                ply_gen_box.label(text="Set PLY dir in PLY Timeline addon", icon='INFO')
+        else:
+            ply_gen_box.label(text="PLY Timeline addon not active", icon='INFO')
 
 
 # ====== Operators ======
@@ -561,10 +602,10 @@ class JSONRENDER_OT_Render(Operator):
 
 
 class JSONRENDER_OT_BatchRender(Operator):
-    """Batch render all JSON files found from image directory"""
+    """Batch render all JSON files found from JSON directory"""
     bl_idname = "json_render.batch_render"
     bl_label = "Batch Render"
-    bl_description = "Render images for all JSON files found from image directory"
+    bl_description = "Render images for all JSON files in the directory"
 
     _timer = None
     _json_files = []
@@ -756,12 +797,96 @@ class JSONRENDER_OT_StopBatch(Operator):
         return {'FINISHED'}
 
 
+class JSONRENDER_OT_GenerateDownsampledPLY(Operator):
+    """Generate downsampled PLY files for all JSON files in JSON Directory"""
+    bl_idname = "json_render.generate_downsampled_ply"
+    bl_label = "Generate Downsampled PLYs"
+    bl_description = "Create downsampled PLY files based on JSON files"
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.json_render_settings
+
+        # Get PLY directory from PLY Timeline addon
+        if not hasattr(scene, 'ply_timeline_settings'):
+            self.report({'ERROR'}, "PLY Timeline addon not active")
+            return {'CANCELLED'}
+
+        ply_settings = scene.ply_timeline_settings
+        ply_directory = bpy.path.abspath(ply_settings.ply_directory)
+
+        if not ply_directory or not os.path.isdir(ply_directory):
+            self.report({'ERROR'}, "PLY directory not set in PLY Timeline addon")
+            return {'CANCELLED'}
+
+        # Get JSON directory
+        json_dir = bpy.path.abspath(settings.json_directory)
+        if not json_dir or not os.path.isdir(json_dir):
+            self.report({'ERROR'}, "JSON directory not set")
+            return {'CANCELLED'}
+
+        # Get all JSON files (with filter if enabled)
+        filter_prefix = settings.filter_prefix if settings.filter_enabled else None
+        json_files = get_json_files_from_directory(settings.json_directory, filter_prefix)
+        if not json_files:
+            self.report({'ERROR'}, "No JSON files found")
+            return {'CANCELLED'}
+
+        ratio = settings.downsample_ratio
+        success_count = 0
+        fail_count = 0
+
+        for json_path in json_files:
+            # Read JSON to get frame number
+            try:
+                with open(json_path, 'r') as f:
+                    data = json.load(f)
+                frame_number = data.get("frame")
+                if frame_number is None:
+                    print(f"[PLY Gen] No frame in JSON: {os.path.basename(json_path)}")
+                    fail_count += 1
+                    continue
+            except Exception as e:
+                print(f"[PLY Gen] Error reading JSON: {e}")
+                fail_count += 1
+                continue
+
+            # Find PLY file for this frame
+            original_ply_path = find_ply_for_frame(ply_directory, frame_number)
+            if not original_ply_path:
+                print(f"[PLY Gen] No PLY for frame {frame_number}")
+                fail_count += 1
+                continue
+
+            # Output path - same directory as JSON, same base name as JSON
+            json_base_name = os.path.splitext(os.path.basename(json_path))[0]
+            output_ply_path = os.path.join(json_dir, f"{json_base_name}.ply")
+
+            # Perform downsampling
+            success, message = downsample_ply(original_ply_path, output_ply_path, ratio)
+
+            if success:
+                print(f"[PLY Gen] {message}")
+                success_count += 1
+            else:
+                print(f"[PLY Gen] Failed: {message}")
+                fail_count += 1
+
+        if success_count > 0:
+            self.report({'INFO'}, f"Generated {success_count} PLY file(s), {fail_count} failed")
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, f"All {fail_count} PLY generation(s) failed")
+            return {'CANCELLED'}
+
+
 # ====== Registration ======
 classes = (
     JSONRenderSettings,
     JSONRENDER_OT_SelectJSON,
     JSONRENDER_OT_ApplyJSON,
     JSONRENDER_OT_Render,
+    JSONRENDER_OT_GenerateDownsampledPLY,
     JSONRENDER_OT_BatchRender,
     JSONRENDER_OT_StopBatch,
     JSONRENDER_PT_MainPanel,

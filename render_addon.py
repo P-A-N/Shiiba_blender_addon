@@ -424,6 +424,7 @@ class CAMERA_PT_InfoPanel(Panel):
             status_row.label(text=f"Saved: {lights_with_data} light(s)", icon='CHECKMARK')
 
         random_box.separator()
+        random_box.operator("camera.view_to_camera", text="Set View to Camera", icon='VIEW_CAMERA')
         random_box.operator("camera.random_position", text="Randomize Camera Position", icon='FILE_REFRESH')
 
         # Loop Render section
@@ -437,6 +438,9 @@ class CAMERA_PT_InfoPanel(Panel):
         row = loop_box.row(align=True)
         row.prop(settings, "frame_min")
         row.prop(settings, "frame_max")
+
+        # Random frame button
+        loop_box.operator("camera.random_frame", text="Random Frame", icon='TIME')
 
         # Optional max renders
         loop_box.prop(settings, "max_renders")
@@ -1398,6 +1402,232 @@ class CAMERA_OT_StopLoopRender(Operator):
         return {'FINISHED'}
 
 
+class CAMERA_OT_RandomFrame(Operator):
+    """Set the current frame to a random value within the configured range"""
+    bl_idname = "camera.random_frame"
+    bl_label = "Random Frame"
+    bl_description = "Jump to a random frame within Frame Min and Frame Max range"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.camera_export_settings
+
+        frame_min = settings.frame_min
+        frame_max = settings.frame_max
+
+        if frame_min >= frame_max:
+            self.report({'ERROR'}, "Frame Min must be less than Frame Max")
+            return {'CANCELLED'}
+
+        random_frame = random.randint(frame_min, frame_max)
+        scene.frame_set(random_frame)
+
+        self.report({'INFO'}, f"Frame set to {random_frame}")
+        return {'FINISHED'}
+
+
+class CAMERA_OT_ViewToCamera(Operator):
+    """Set camera position and rotation to match the current 3D viewport view"""
+    bl_idname = "camera.view_to_camera"
+    bl_label = "View to Camera"
+    bl_description = "Set the active camera's position and rotation to match the current 3D viewport"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        camera = scene.camera
+        settings = scene.camera_export_settings
+
+        if camera is None:
+            self.report({'ERROR'}, "No active camera")
+            return {'CANCELLED'}
+
+        if camera.type != 'CAMERA':
+            self.report({'ERROR'}, "Active object is not a camera")
+            return {'CANCELLED'}
+
+        # Find the 3D viewport
+        area = None
+        for a in context.screen.areas:
+            if a.type == 'VIEW_3D':
+                area = a
+                break
+
+        if area is None:
+            self.report({'ERROR'}, "No 3D viewport found")
+            return {'CANCELLED'}
+
+        # Get the region_3d from the viewport
+        region_3d = area.spaces.active.region_3d
+
+        # Get the view matrix and extract position/rotation
+        view_matrix = region_3d.view_matrix.inverted()
+
+        # Set camera position
+        camera.location = view_matrix.translation
+
+        # Set camera rotation
+        camera.rotation_mode = 'QUATERNION'
+        camera.rotation_quaternion = view_matrix.to_quaternion()
+
+        # Move lights with camera if enabled
+        moved_lights = 0
+        if settings.move_lights_with_camera:
+            # Get target position for backlight calculation
+            target = scene.objects.get("PLY_CameraTarget")
+            target_pos = target.location if target else camera.location
+
+            # Get all lights in the scene
+            lights = [obj for obj in scene.objects if obj.type == 'LIGHT']
+
+            for light in lights:
+                # Check if this is a backlight (name contains "Back")
+                is_backlight = "back" in light.name.lower()
+
+                if is_backlight:
+                    # Backlight: place on opposite side of target from camera, 10m from target
+                    camera_to_target = target_pos - camera.location
+                    camera_to_target_normalized = camera_to_target.normalized()
+
+                    # Place backlight 10m beyond target (opposite side from camera)
+                    backlight_distance = 10.0
+                    light.location = target_pos + camera_to_target_normalized * backlight_distance
+
+                    # Make backlight face the target
+                    light_direction = target_pos - light.location
+                    light.rotation_mode = 'QUATERNION'
+                    light_rot_quat = light_direction.to_track_quat('-Z', 'Y')
+                    light.rotation_quaternion = light_rot_quat
+
+                    moved_lights += 1
+
+                # Check if light has saved offset data (for non-backlights)
+                elif ("camera_offset_x" in light and
+                      "camera_offset_y" in light and
+                      "camera_offset_z" in light):
+
+                    # Retrieve stored offset
+                    local_offset = Vector((
+                        light["camera_offset_x"],
+                        light["camera_offset_y"],
+                        light["camera_offset_z"]
+                    ))
+
+                    # Transform offset to world space using camera's rotation
+                    camera_matrix = camera.rotation_quaternion.to_matrix()
+                    world_offset = camera_matrix @ local_offset
+
+                    # Set light position
+                    light.location = camera.location + world_offset
+
+                    # Make light face the target
+                    light_direction = target_pos - light.location
+                    light.rotation_mode = 'QUATERNION'
+                    light_rot_quat = light_direction.to_track_quat('-Z', 'Y')
+                    light.rotation_quaternion = light_rot_quat
+
+                    moved_lights += 1
+
+        # Export JSON file (same logic as render button, but without rendering)
+        export_base_dir = bpy.path.abspath(settings.export_directory)
+        work_name = settings.work_name
+        frame_number = scene.frame_current
+
+        # Create output directory
+        output_dir = os.path.join(export_base_dir, work_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Find next available filename with index if file exists
+        base_filename = f"{work_name}_{frame_number:05d}"
+        json_filename = f"{base_filename}.json"
+        json_path = os.path.join(output_dir, json_filename)
+
+        index = 1
+        while os.path.exists(json_path):
+            json_filename = f"{base_filename}_{index}.json"
+            json_path = os.path.join(output_dir, json_filename)
+            index += 1
+
+        # Export camera and lights data to JSON
+        cam_data = camera.data
+
+        # Get camera rotation as quaternion
+        quaternion_blender = camera.rotation_quaternion.copy()
+
+        # Export lights data
+        lights_data = []
+        for obj in scene.objects:
+            if obj.type == 'LIGHT':
+                light_data_obj = obj.data
+
+                # Get light position
+                light_pos = {
+                    "x": float(obj.location.x),
+                    "y": float(obj.location.y),
+                    "z": float(obj.location.z)
+                }
+
+                # Get light rotation as quaternion
+                if obj.rotation_mode == 'QUATERNION':
+                    light_quat = obj.rotation_quaternion.copy()
+                elif obj.rotation_mode == 'AXIS_ANGLE':
+                    light_quat = obj.rotation_axis_angle.to_quaternion()
+                else:
+                    light_quat = obj.rotation_euler.to_quaternion()
+
+                light_rot = {
+                    "x": float(light_quat.x),
+                    "y": float(light_quat.y),
+                    "z": float(light_quat.z),
+                    "w": float(light_quat.w)
+                }
+
+                light_info = {
+                    "name": obj.name,
+                    "type": light_data_obj.type,
+                    "position": light_pos,
+                    "rotation": light_rot,
+                    "energy": float(light_data_obj.energy),
+                    "color": [float(c) for c in light_data_obj.color]
+                }
+
+                if light_data_obj.type == 'SPOT':
+                    light_info["spot_size"] = float(light_data_obj.spot_size)
+                    light_info["spot_blend"] = float(light_data_obj.spot_blend)
+
+                lights_data.append(light_info)
+
+        # Prepare JSON data
+        camera_data = {
+            "position": {
+                "x": float(camera.location.x),
+                "y": float(camera.location.y),
+                "z": float(camera.location.z)
+            },
+            "rotation": {
+                "x": float(quaternion_blender.x),
+                "y": float(quaternion_blender.y),
+                "z": float(quaternion_blender.z),
+                "w": float(quaternion_blender.w)
+            },
+            "fov": float(cam_data.angle),
+            "frame": frame_number,
+            "lights": lights_data
+        }
+
+        # Round floats and write JSON
+        camera_data = round_floats(camera_data, precision=10)
+        with open(json_path, 'w') as f:
+            json.dump(camera_data, f, indent=2)
+
+        if moved_lights > 0:
+            self.report({'INFO'}, f"Camera set to current view - {moved_lights} light(s) moved - JSON exported: {json_filename}")
+        else:
+            self.report({'INFO'}, f"Camera set to current view - JSON exported: {json_filename}")
+        return {'FINISHED'}
+
+
 # ====== Registration ======
 classes = (
     CameraExportSettings,
@@ -1406,6 +1636,8 @@ classes = (
     CAMERA_OT_RandomPosition,
     CAMERA_OT_LoopRender,
     CAMERA_OT_StopLoopRender,
+    CAMERA_OT_RandomFrame,
+    CAMERA_OT_ViewToCamera,
     CAMERA_PT_InfoPanel,
 )
 
