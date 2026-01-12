@@ -94,6 +94,13 @@ class JSONRenderSettings(PropertyGroup):
         subtype='PERCENTAGE'
     )
 
+    # Skip existing option
+    skip_existing: BoolProperty(
+        name="Skip Existing",
+        description="Skip rendering if output file already exists",
+        default=False
+    )
+
 
 # ====== Helper Functions ======
 def downsample_ply(original_ply_path, output_ply_path, ratio):
@@ -451,6 +458,9 @@ class JSONRENDER_PT_MainPanel(Panel):
         if settings.filter_enabled:
             batch_box.prop(settings, "filter_prefix", text="Prefix")
 
+        # Skip existing option
+        batch_box.prop(settings, "skip_existing")
+
         # Show JSON file count (with filter applied)
         filter_prefix = settings.filter_prefix if settings.filter_enabled else None
         json_files = get_json_files_from_directory(settings.json_directory, filter_prefix)
@@ -662,19 +672,26 @@ class JSONRENDER_OT_BatchRender(Operator):
         json_path = self._json_files[self._current_index]
         print(f"[Batch Render] Processing {self._current_index + 1}/{len(self._json_files)}: {os.path.basename(json_path)}")
 
-        # Apply JSON data
-        success, message = apply_json_to_scene(context, json_path)
-        if not success:
-            print(f"[Batch Render] Error applying JSON: {message}")
-            self._current_index += 1
-            return
-
         # Prepare output path
         output_dir = bpy.path.abspath(settings.output_directory)
         os.makedirs(output_dir, exist_ok=True)
 
         base_name = os.path.splitext(os.path.basename(json_path))[0]
         output_path = os.path.join(output_dir, f"{base_name}.png")
+
+        # Skip if file exists and skip_existing is enabled
+        if settings.skip_existing and os.path.exists(output_path):
+            print(f"[Batch Render] Skipping (exists): {os.path.basename(output_path)}")
+            self._current_index += 1
+            self._needs_count_update = True
+            return
+
+        # Apply JSON data
+        success, message = apply_json_to_scene(context, json_path)
+        if not success:
+            print(f"[Batch Render] Error applying JSON: {message}")
+            self._current_index += 1
+            return
 
         # Set render output path
         scene.render.filepath = output_path
