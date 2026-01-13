@@ -28,6 +28,15 @@ def main():
             dest_path = current_dir / json_filename
             shutil.copy2(json_path, dest_path)
             print(f"Copied: {json_filename}")
+
+            # Also copy PLY file if it exists
+            ply_filename = f"{base_name}.ply"
+            ply_path = parent_dir / ply_filename
+            if ply_path.exists():
+                ply_dest_path = current_dir / ply_filename
+                shutil.copy2(ply_path, ply_dest_path)
+                print(f"Copied: {ply_filename}")
+
             found_count += 1
         else:
             # Create notfound directory if it doesn't exist
