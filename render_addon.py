@@ -1187,13 +1187,9 @@ class CAMERA_OT_LoopRender(Operator):
 
             # Check if render is pending and delay has passed (1 second)
             elif settings.loop_render_pending:
-                if time.time() - settings.loop_render_start_time >= 1.0:
+                if time.time() - settings.loop_render_start_time >= 0.1:
                     settings.loop_render_pending = False
-                    print(f"[Loop Render] Starting render now (from modal with valid context)")
-                    try:
-                        context.view_layer.update()
-                    except Exception as e:
-                        print(f"[Loop Render] Pre-render view layer update warning: {e}")
+                    print(f"[Loop Render] Starting render now")
                     bpy.ops.render.render('INVOKE_DEFAULT', write_still=True)
             # If not waiting, start next iteration
             # Use settings.loop_waiting_for_render instead of self._waiting_for_render
@@ -1234,23 +1230,11 @@ class CAMERA_OT_LoopRender(Operator):
             return self.finish(context)
 
         random_frame = random.randint(frame_min, frame_max)
-        # frame_set() triggers depsgraph update internally
+        # frame_set() triggers depsgraph update internally (including PLY loading)
         scene.frame_set(random_frame)
-
-        # Wait for depsgraph to stabilize after frame change
-        try:
-            context.view_layer.update()
-        except Exception as e:
-            print(f"[Loop Render] View layer update after frame_set warning: {e}")
 
         # Randomize camera position
         bpy.ops.camera.random_position()
-
-        # Ensure depsgraph is stable after camera move
-        try:
-            context.view_layer.update()
-        except Exception as e:
-            print(f"[Loop Render] View layer update after camera move warning: {e}")
 
         # Prepare render paths (same logic as CAMERA_OT_RenderAndExport)
         export_base_dir = bpy.path.abspath(settings.export_directory)

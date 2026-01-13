@@ -23,11 +23,20 @@ def main():
         json_filename = f"{base_name}.json"
         json_path = parent_dir / json_filename
 
-        if json_path.exists():
+        # Check for PLY file
+        ply_filename = f"{base_name}.ply"
+        ply_path = parent_dir / ply_filename
+
+        if json_path.exists() and ply_path.exists():
             # Copy JSON file to current directory
-            dest_path = current_dir / json_filename
-            shutil.copy2(json_path, dest_path)
+            dest_json = current_dir / json_filename
+            shutil.copy2(json_path, dest_json)
             print(f"Copied: {json_filename}")
+
+            # Copy PLY file to current directory
+            dest_ply = current_dir / ply_filename
+            shutil.copy2(ply_path, dest_ply)
+            print(f"Copied: {ply_filename}")
             found_count += 1
         else:
             # Create notfound directory if it doesn't exist
@@ -39,7 +48,7 @@ def main():
             notfound_count += 1
 
     print(f"\nSummary:")
-    print(f"  JSON files copied: {found_count}")
+    print(f"  JSON + PLY files copied: {found_count}")
     print(f"  PNG files moved to notfound: {notfound_count}")
 
 if __name__ == "__main__":

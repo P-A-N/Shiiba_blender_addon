@@ -466,6 +466,16 @@ class JSONRENDER_PT_MainPanel(Panel):
         json_files = get_json_files_from_directory(settings.json_directory, filter_prefix)
         batch_box.label(text=f"Found {len(json_files)} JSON file(s)", icon='FILE')
 
+        # Export Downsampled PLY Only button (above Start Batch Render)
+        if not settings.is_batch_rendering and len(json_files) > 0:
+            if hasattr(scene, 'ply_timeline_settings'):
+                ply_settings = scene.ply_timeline_settings
+                ply_dir = bpy.path.abspath(ply_settings.ply_directory)
+                if ply_dir and os.path.isdir(ply_dir):
+                    row = batch_box.row()
+                    row.scale_y = 1.3
+                    row.operator("json_render.export_downsampled_ply_only", text=f"Export Downsampled PLY ({len(json_files)})", icon='MESH_DATA')
+
         # Batch render controls
         if settings.is_batch_rendering:
             # Show progress
@@ -824,6 +834,91 @@ class JSONRENDER_OT_StopBatch(Operator):
         return {'FINISHED'}
 
 
+class JSONRENDER_OT_ExportDownsampledPLYOnly(Operator):
+    """Export downsampled PLY files to output directory (same as batch render PLY export)"""
+    bl_idname = "json_render.export_downsampled_ply_only"
+    bl_label = "Export Downsampled PLY Only"
+    bl_description = "Export downsampled PLY files to output directory based on JSON files"
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.json_render_settings
+
+        # Get PLY directory from PLY Timeline addon
+        if not hasattr(scene, 'ply_timeline_settings'):
+            self.report({'ERROR'}, "PLY Timeline addon not active")
+            return {'CANCELLED'}
+
+        ply_settings = scene.ply_timeline_settings
+        ply_directory = bpy.path.abspath(ply_settings.ply_directory)
+
+        if not ply_directory or not os.path.isdir(ply_directory):
+            self.report({'ERROR'}, "PLY directory not set in PLY Timeline addon")
+            return {'CANCELLED'}
+
+        # Get output directory
+        output_dir = bpy.path.abspath(settings.output_directory)
+        if not output_dir:
+            self.report({'ERROR'}, "Output directory not set")
+            return {'CANCELLED'}
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Get all JSON files (with filter if enabled)
+        filter_prefix = settings.filter_prefix if settings.filter_enabled else None
+        json_files = get_json_files_from_directory(settings.json_directory, filter_prefix)
+        if not json_files:
+            self.report({'ERROR'}, "No JSON files found")
+            return {'CANCELLED'}
+
+        ratio = settings.downsample_ratio
+        success_count = 0
+        fail_count = 0
+
+        for json_path in json_files:
+            # Read JSON to get frame number
+            try:
+                with open(json_path, 'r') as f:
+                    data = json.load(f)
+                frame_number = data.get("frame")
+                if frame_number is None:
+                    print(f"[PLY Export] No frame in JSON: {os.path.basename(json_path)}")
+                    fail_count += 1
+                    continue
+            except Exception as e:
+                print(f"[PLY Export] Error reading JSON: {e}")
+                fail_count += 1
+                continue
+
+            # Find PLY file for this frame
+            original_ply_path = find_ply_for_frame(ply_directory, frame_number)
+            if not original_ply_path:
+                print(f"[PLY Export] No PLY for frame {frame_number}")
+                fail_count += 1
+                continue
+
+            # Output path - output directory, same base name as JSON
+            json_base_name = os.path.splitext(os.path.basename(json_path))[0]
+            output_ply_path = os.path.join(output_dir, f"{json_base_name}.ply")
+
+            # Perform downsampling
+            success, message = downsample_ply(original_ply_path, output_ply_path, ratio)
+
+            if success:
+                print(f"[PLY Export] {message}")
+                success_count += 1
+            else:
+                print(f"[PLY Export] Failed: {message}")
+                fail_count += 1
+
+        if success_count > 0:
+            self.report({'INFO'}, f"Exported {success_count} PLY file(s) to output dir, {fail_count} failed")
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, f"All {fail_count} PLY export(s) failed")
+            return {'CANCELLED'}
+
+
 class JSONRENDER_OT_GenerateDownsampledPLY(Operator):
     """Generate downsampled PLY files for all JSON files in JSON Directory"""
     bl_idname = "json_render.generate_downsampled_ply"
@@ -913,6 +1008,7 @@ classes = (
     JSONRENDER_OT_SelectJSON,
     JSONRENDER_OT_ApplyJSON,
     JSONRENDER_OT_Render,
+    JSONRENDER_OT_ExportDownsampledPLYOnly,
     JSONRENDER_OT_GenerateDownsampledPLY,
     JSONRENDER_OT_BatchRender,
     JSONRENDER_OT_StopBatch,
