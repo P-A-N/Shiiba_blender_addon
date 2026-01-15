@@ -19,6 +19,13 @@ def get_dance_name(filename: str) -> str:
     return ""
 
 
+def format_float(value) -> str:
+    """Format float without scientific notation, removing trailing zeros."""
+    if isinstance(value, float):
+        return f"{value:.10f}".rstrip('0').rstrip('.')
+    return value
+
+
 def json_to_csv(json_dir: str = ".", output_csv: str = "output.csv"):
     """
     Read all JSON files from a directory and create a single CSV file.
@@ -50,14 +57,14 @@ def json_to_csv(json_dir: str = ".", output_csv: str = "output.csv"):
             "png_file": png_filename,
             "dance": dance_name,
             "frame": data.get("frame", ""),
-            "fov": data.get("fov", ""),
-            "position_x": position.get("x", ""),
-            "position_y": position.get("y", ""),
-            "position_z": position.get("z", ""),
-            "rotation_x": rotation.get("x", ""),
-            "rotation_y": rotation.get("y", ""),
-            "rotation_z": rotation.get("z", ""),
-            "rotation_w": rotation.get("w", ""),
+            "fov": format_float(data.get("fov", "")),
+            "position_x": format_float(position.get("x", "")),
+            "position_y": format_float(position.get("y", "")),
+            "position_z": format_float(position.get("z", "")),
+            "rotation_x": format_float(rotation.get("x", "")),
+            "rotation_y": format_float(rotation.get("y", "")),
+            "rotation_z": format_float(rotation.get("z", "")),
+            "rotation_w": format_float(rotation.get("w", "")),
         }
         rows.append(row)
 

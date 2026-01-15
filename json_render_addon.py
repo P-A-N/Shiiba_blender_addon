@@ -432,6 +432,11 @@ class JSONRENDER_PT_MainPanel(Panel):
         row.scale_y = 1.3
         row.operator("json_render.apply_json", text="Apply", icon='IMPORT')
 
+        # Export button
+        row = action_box.row()
+        row.scale_y = 1.3
+        row.operator("json_render.export_json", text="Export", icon='EXPORT')
+
         # Render button
         row = action_box.row()
         row.scale_y = 1.5
@@ -834,6 +839,125 @@ class JSONRENDER_OT_StopBatch(Operator):
         return {'FINISHED'}
 
 
+class JSONRENDER_OT_ExportJSON(Operator):
+    """Export current camera and light settings to JSON file"""
+    bl_idname = "json_render.export_json"
+    bl_label = "Export Settings to JSON"
+    bl_description = "Export current frame, camera position/rotation/FOV, and light settings to JSON"
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.json_render_settings
+        camera = scene.camera
+
+        if camera is None:
+            self.report({'ERROR'}, "No active camera in scene")
+            return {'CANCELLED'}
+
+        # Prepare output path (same as image export)
+        output_dir = bpy.path.abspath(settings.output_directory)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Generate output filename from JSON filename or use default (same logic as render)
+        if settings.json_file:
+            json_filename = os.path.basename(bpy.path.abspath(settings.json_file))
+            base_name = os.path.splitext(json_filename)[0]
+        else:
+            base_name = f"render_{scene.frame_current:05d}"
+
+        output_path = os.path.join(output_dir, f"{base_name}.json")
+
+        # Check if file exists and find next available index (same as render)
+        if os.path.exists(output_path):
+            index = 1
+            while os.path.exists(os.path.join(output_dir, f"{base_name}_{index}.json")):
+                index += 1
+            output_path = os.path.join(output_dir, f"{base_name}_{index}.json")
+
+        # Build JSON data
+        data = {}
+
+        # Frame
+        data["frame"] = scene.frame_current
+
+        # Camera position
+        data["position"] = {
+            "x": camera.location.x,
+            "y": camera.location.y,
+            "z": camera.location.z
+        }
+
+        # Camera rotation (convert to quaternion if needed)
+        if camera.rotation_mode == 'QUATERNION':
+            quat = camera.rotation_quaternion
+        else:
+            quat = camera.rotation_euler.to_quaternion()
+
+        data["rotation"] = {
+            "w": quat.w,
+            "x": quat.x,
+            "y": quat.y,
+            "z": quat.z
+        }
+
+        # Camera FOV
+        data["fov"] = camera.data.angle
+
+        # Collect all lights in scene
+        lights = []
+        for obj in scene.objects:
+            if obj.type == 'LIGHT':
+                light_data = {
+                    "name": obj.name
+                }
+
+                # Light position
+                light_data["position"] = {
+                    "x": obj.location.x,
+                    "y": obj.location.y,
+                    "z": obj.location.z
+                }
+
+                # Light rotation (convert to quaternion if needed)
+                if obj.rotation_mode == 'QUATERNION':
+                    light_quat = obj.rotation_quaternion
+                else:
+                    light_quat = obj.rotation_euler.to_quaternion()
+
+                light_data["rotation"] = {
+                    "w": light_quat.w,
+                    "x": light_quat.x,
+                    "y": light_quat.y,
+                    "z": light_quat.z
+                }
+
+                # Light energy
+                light_data["energy"] = obj.data.energy
+
+                # Light color
+                light_data["color"] = list(obj.data.color)
+
+                # Spot-specific properties
+                if obj.data.type == 'SPOT':
+                    light_data["spot_size"] = obj.data.spot_size
+                    light_data["spot_blend"] = obj.data.spot_blend
+
+                lights.append(light_data)
+
+        if lights:
+            data["lights"] = lights
+
+        # Write JSON file
+        try:
+            with open(output_path, 'w') as f:
+                json.dump(data, f, indent=2)
+            self.report({'INFO'}, f"Exported to: {output_path}")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Error writing JSON: {str(e)}")
+            return {'CANCELLED'}
+
+
 class JSONRENDER_OT_ExportDownsampledPLYOnly(Operator):
     """Export downsampled PLY files to output directory (same as batch render PLY export)"""
     bl_idname = "json_render.export_downsampled_ply_only"
@@ -1007,6 +1131,7 @@ classes = (
     JSONRenderSettings,
     JSONRENDER_OT_SelectJSON,
     JSONRENDER_OT_ApplyJSON,
+    JSONRENDER_OT_ExportJSON,
     JSONRENDER_OT_Render,
     JSONRENDER_OT_ExportDownsampledPLYOnly,
     JSONRENDER_OT_GenerateDownsampledPLY,
