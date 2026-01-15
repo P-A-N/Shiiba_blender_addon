@@ -1119,6 +1119,7 @@ class CAMERA_OT_RandomPosition(Operator):
 # Module-level state for loop render (avoids Blender's restricted context issues)
 _loop_render_state = {
     'export_pending': False,
+    'operator_instance': None,  # Store operator instance for timer-based export
 }
 
 
@@ -1185,7 +1186,7 @@ class CAMERA_OT_LoopRender(Operator):
                 settings.loop_waiting_for_render = False
                 print(f"[Loop Render] Ready for next render")
 
-            # Check if render is pending and delay has passed (1 second)
+            # Check if render is pending and delay has passed (minimal delay for stability)
             elif settings.loop_render_pending:
                 if time.time() - settings.loop_render_start_time >= 0.1:
                     settings.loop_render_pending = False
@@ -1208,13 +1209,23 @@ class CAMERA_OT_LoopRender(Operator):
         try:
             if self.render_complete_handler in bpy.app.handlers.render_complete:
                 bpy.app.handlers.render_complete.remove(self.render_complete_handler)
+                print(f"[Loop Render] Handler removed successfully")
         except Exception as e:
             print(f"[Loop Render] Error removing handler: {e}")
 
         # Signal the modal to perform export on next tick
         # Use module-level state because we cannot write to Blender ID classes in this context
         _loop_render_state['export_pending'] = True
-        print(f"[Loop Render] Export pending flag set, modal will handle export")
+        print(f"[Loop Render] Export pending flag set to True")
+
+        # Force UI redraw to wake up the modal operator
+        def force_redraw():
+            print(f"[Loop Render] Forcing UI redraw to wake up modal...")
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    area.tag_redraw()
+            return None
+        bpy.app.timers.register(force_redraw, first_interval=0.1)
 
     def start_next_render(self, context):
         """Select random frame, randomize camera, and start render"""
@@ -1295,11 +1306,10 @@ class CAMERA_OT_LoopRender(Operator):
         settings.loop_waiting_for_render = True
 
         # Schedule render to start from modal loop (where we have valid context)
-        # Using a timer here causes "Python context internal state bug" errors
         import time
         settings.loop_render_pending = True
         settings.loop_render_start_time = time.time()
-        print(f"[Loop Render] Scheduled render to start (1s delay, via modal)")
+        print(f"[Loop Render] Scheduled render to start (via modal)")
 
     def export_data_after_render(self, context):
         """Export PLY, blend file, and JSON data after render completes"""
