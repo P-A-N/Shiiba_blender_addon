@@ -931,6 +931,9 @@ class JSONRENDER_OT_ExportJSON(Operator):
                     "z": light_quat.z
                 }
 
+                # Light type
+                light_data["type"] = obj.data.type
+
                 # Light energy
                 light_data["energy"] = obj.data.energy
 
